@@ -1272,7 +1272,7 @@ dit(bf(tt(ABSTRACT-RECV:<string>)))
 dit(bf(tt(ABSTRACT-CLIENT:<string>)))
    The ABSTRACT addresses are almost identical to the related UNIX addresses
    except that they do not address file system based sockets but an alternate
-   unixdomain() address space. To archieve this the socket address strings are
+   unixdomain() address space. To achieve this the socket address strings are
    prefixed with "\0" internally. This feature is available (only?) on Linux.
    Option groups are the same as with the related UNIX addresses, except that
    the ABSTRACT addresses are not member of the NAMED group.
@@ -1745,7 +1745,7 @@ label(OPTION_PROMPT)dit(bf(tt(prompt=<string>)))
    Passes the string as prompt to the readline function. readline prints this
    prompt when stepping through the history. If this string matches a constant
    prompt issued by an interactive program on the other socat address,
-   consistent look and feel can be archieved.
+   consistent look and feel can be achieved.
 enddit()
 
 startdit()enddit()nl()
@@ -2657,7 +2657,7 @@ label(OPTION_OPENSSL_EGD)dit(bf(tt(egd=<filename>)))
 label(OPTION_OPENSSL_PSEUDO)dit(bf(tt(pseudo)))
    On systems where openssl cannot find an entropy source and where no entropy
    gathering daemon can be utilized, this option activates a mechanism for
-   providing pseudo entropy. This is archieved by taking the current time in
+   providing pseudo entropy. This is achieved by taking the current time in
    microseconds for feeding the libc pseudo random number generator with an
    initial value. openssl is then feeded with output from random\() calls.nl()
    NOTE:This mechanism is not sufficient for generation of secure keys!
