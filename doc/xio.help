@@ -565,7 +565,7 @@ Platforms: all
 
 Sets the FD_CLOEXEC (close-on-exec) flag on the file descriptor via a
 fcntl()call with F_SETFD. Use with caution, because xioopen() makes use of this
-flag to archieve what we consider the most reasonable behaviour; using this
+flag to achieve what we consider the most reasonable behaviour; using this
 option overrides xioopen's setting!
 
 
@@ -4458,7 +4458,7 @@ Platforms: all
 Passes the string as prompt to the readline function. readline prints this
 prompt when stepping through the history. If this string matches a constant
 prompt issued by an interactive program on the other socat address,
-consistent look and feel can be archieved.
+consistent look and feel can be achieved.
 
 ===============================================================================
 OPENSSL options
@@ -4589,7 +4589,7 @@ Platforms: (depends on openssl installation)
 
 On systems where openssl cannot find an entropy source and where no entropy
 gathering daemon can be utilized, this option activates a mechanism for
-providing pseudo entropy. This is archieved by taking the current time in
+providing pseudo entropy. This is achieved by taking the current time in
 microseconds for feeding the libc pseudo random number generator with an
 initial value. openssl is then feeded with output from random calls.
 NOTE:This mechanism is not sufficient for generation of secure keys!
