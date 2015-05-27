@@ -1,5 +1,5 @@
 /* source: xioopts.h */
-/* Copyright Gerhard Rieger 2001-2009 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 #ifndef __xioopts_h_included
@@ -473,6 +473,7 @@ enum e_optcode {
    OPT_OPENSSL_CAPATH,
    OPT_OPENSSL_CERTIFICATE,
    OPT_OPENSSL_CIPHERLIST,
+   OPT_OPENSSL_COMMONNAME,
 #if OPENSSL_VERSION_NUMBER >= 0x00908000L
    OPT_OPENSSL_COMPRESS,
 #endif
@@ -784,6 +785,8 @@ enum e_optcode {
 #ifdef TCP_WINDOW_CLAMP
    OPT_TCP_WINDOW_CLAMP,	/* Linux 2.4.0 */
 #endif
+   OPT_TERMIOS_CFMAKERAW,	/* termios.cfmakeraw() */
+   OPT_TERMIOS_RAWER,
    OPT_TIOCSCTTY,
    OPT_TOSTOP,		/* termios.c_lflag */
    OPT_TUN_DEVICE,	/* tun: /dev/net/tun ... */

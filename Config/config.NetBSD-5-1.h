@@ -1,617 +1,522 @@
+/* config.h.  Generated from config.h.in by configure.  */
 /* source: config.h.in */
-/* Copyright Gerhard Rieger */
+/* Copyright Gerhard Rieger 2001-2008 */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 #ifndef __config_h_included
 #define __config_h_included 1
 
 /* Define to empty if the keyword does not work.  */
-#undef const
+/* #undef const */
 
 /* Define to `int' if <sys/types.h> doesn't define.  */
-#undef gid_t
+/* #undef gid_t */
 
 /* Define if your struct stat has st_blksize.  */
-#undef HAVE_ST_BLKSIZE
+#define HAVE_ST_BLKSIZE 1
 
 /* Define if your struct stat has st_blocks.  */
-#undef HAVE_ST_BLOCKS
+#define HAVE_ST_BLOCKS 1
 
 /* Define if your struct stat has st_rdev.  */
-#undef HAVE_ST_RDEV
+#define HAVE_ST_RDEV 1
 
 /* Define if you have the strftime function.  */
-#undef HAVE_STRFTIME
+#define HAVE_STRFTIME 1
 
 /* Define if you have <sys/wait.h> that is POSIX.1 compatible.  */
-#undef HAVE_SYS_WAIT_H
+#define HAVE_SYS_WAIT_H 1
 
 /* Define to `int' if <sys/types.h> doesn't define.  */
-#undef mode_t
+/* #undef mode_t */
 
 /* Define to `long' if <sys/types.h> doesn't define.  */
-#undef off_t
+/* #undef off_t */
 
 /* Define to `int' if <sys/types.h> doesn't define.  */
-#undef pid_t
+/* #undef pid_t */
 
 /* Define as the return type of signal handlers (int or void).  */
-#undef RETSIGTYPE
+#define RETSIGTYPE void
 
 /* Define to `unsigned' if <sys/types.h> doesn't define.  */
-#undef size_t
+/* #undef size_t */
 
 /* Define if you have the ANSI C header files.  */
-#undef STDC_HEADERS
+#define STDC_HEADERS 1
 
 /* Define if you can safely include both <sys/time.h> and <time.h>.  */
-#undef TIME_WITH_SYS_TIME
+#define TIME_WITH_SYS_TIME 1
 
 /* Define to `int' if <sys/types.h> doesn't define.  */
-#undef uid_t
+/* #undef uid_t */
 
 /* Define if you have the putenv function.  */
-#undef HAVE_PUTENV
-
-/* Define if your cc provides char **environ declaration.
-   This implies HAVE_VAR_ENVIRON */
-#undef HAVE_DECL_ENVIRON
-
-/* Define if you have the char **environ variable */
-#undef HAVE_VAR_ENVIRON
+#define HAVE_PUTENV 1
 
 /* Define if you have the select function.  */
-#undef HAVE_SELECT
+#define HAVE_SELECT 1
 
 /* Define if you have the poll function.  */
-#undef HAVE_POLL
+#define HAVE_POLL 1
 
 /* Define if you have the socket function.  */
-#undef HAVE_SOCKET
+#define HAVE_SOCKET 1
 
 /* Define if you have the strdup function.  */
-#undef HAVE_PROTOTYPE_LIB_strdup
+#define HAVE_STRDUP 1
 
 /* Define if you have the strerror function.  */
-#undef HAVE_PROTOTYPE_LIB_strerror
+#define HAVE_STRERROR 1
 
 /* Define if you have the strstr function.  */
-#undef HAVE_PROTOTYPE_LIB_strstr
+#define HAVE_STRSTR 1
 
 /* Define if you have the strtod function.  */
-#undef HAVE_STRTOD
+#define HAVE_STRTOD 1
 
 /* Define if you have the strtol function.  */
-#undef HAVE_STRTOL
+#define HAVE_STRTOL 1
 
 /* Define if you have the strtoul function.  */
-#undef HAVE_STRTOUL
+#define HAVE_STRTOUL 1
 
 /* Define if you have the uname function.  */
-#undef HAVE_UNAME
+#define HAVE_UNAME 1
 
 /* Define if you have the getpgid function.  */
-#undef HAVE_GETPGID
+#define HAVE_GETPGID 1
 
 /* Define if you have the getsid function.  */
-#undef HAVE_GETSID
+#define HAVE_GETSID 1
 
 /* Define if you have the nanosleep function.  */
-#undef HAVE_NANOSLEEP
+#define HAVE_NANOSLEEP 1
 
 /* Define if you have the getaddrinfo function.  */
-#undef HAVE_GETADDRINFO
+#define HAVE_GETADDRINFO 1
 
 /* Define if you have the getipnodebyname function.  */
-#undef HAVE_PROTOTYPE_LIB_getipnodebyname
+/* #undef HAVE_GETIPNODEBYNAME */
 
 /* Define if you have the setgroups function. */
-#undef HAVE_SETGROUPS
+#define HAVE_SETGROUPS 1
 
 /* Define if you have the inet_aton function. */
-#undef HAVE_INET_ATON
+#define HAVE_INET_ATON 1
 
 /* Define if you have the memrchr function. */
-#undef HAVE_PROTOTYPE_LIB_memrchr
+/* #undef HAVE_MEMRCHR */
 
 /* Define if you have the if_indextoname function. */
-#undef HAVE_PROTOTYPE_LIB_if_indextoname
+#define HAVE_IF_INDEXTONAME 1
 
 /* Define if you have the sigaction function */
-#undef HAVE_SIGACTION
+#define HAVE_SIGACTION 1
 
 /* Define if you have the stat64 function */
-#undef HAVE_STAT64
+/* #undef HAVE_STAT64 */
 
 /* Define if you have the fstat64 function */
-#undef HAVE_FSTAT64
+/* #undef HAVE_FSTAT64 */
 
 /* Define if you have the lstat64 function */
-#undef HAVE_LSTAT64
+/* #undef HAVE_LSTAT64 */
 
 /* Define if you have the lseek64 function */
-#undef HAVE_LSEEK64
+/* #undef HAVE_LSEEK64 */
 
 /* Define if you have the truncate64 function */
-#undef HAVE_TRUNCATE64
+/* #undef HAVE_TRUNCATE64 */
 
 /* Define if you have the ftruncate64 function */
-#undef HAVE_FTRUNCATE64
-
-/* Define if you have the clock_gettime function */
-#undef HAVE_CLOCK_GETTIME
+/* #undef HAVE_FTRUNCATE64 */
 
 /* Define if you have the strtoll function */
-#undef HAVE_STRTOLL
+#define HAVE_STRTOLL 1
 
 /* Define if you have the hstrerror function */
-#undef HAVE_HSTRERROR
+#define HAVE_HSTRERROR 1
 
 /* Define if you have the inet_ntop function */
-#undef HAVE_INET_NTOP
+#define HAVE_INET_NTOP 1
 
 /* Define if you have the hstrerror prototype */
-#undef HAVE_PROTOTYPE_HSTRERROR
-
-/* Define if you have the <stdbool.h> header file.  */
-#undef HAVE_STDBOOL_H
-
-/* Define if you have the <inttypes.h> header file.  */
-#undef HAVE_INTTYPES_H
+#define HAVE_PROTOTYPE_HSTRERROR 1
 
 /* Define if you have the <fcntl.h> header file.  */
-#undef HAVE_FCNTL_H
+#define HAVE_FCNTL_H 1
 
 /* Define if you have the <limits.h> header file.  */
-#undef HAVE_LIMITS_H
+#define HAVE_LIMITS_H 1
 
 /* Define if you have the <strings.h> header file.  */
-#undef HAVE_STRINGS_H
+#define HAVE_STRINGS_H 1
 
 /* Define if you have the <sys/param.h> header file.  */
-#undef HAVE_SYS_PARAM_H
+#define HAVE_SYS_PARAM_H 1
 
 /* Define if you have the <sys/ioctl.h> header file.  */
-#undef HAVE_SYS_IOCTL_H
+#define HAVE_SYS_IOCTL_H 1
 
 /* Define if you have the <sys/time.h> header file.  */
-#undef HAVE_SYS_TIME_H
+#define HAVE_SYS_TIME_H 1
 
 /* Define if you have the <syslog.h> header file.  */
-#undef HAVE_SYSLOG_H
+#define HAVE_SYSLOG_H 1
 
 /* Define if you have the <unistd.h> header file.  */
-#undef HAVE_UNISTD_H
+#define HAVE_UNISTD_H 1
 
 /* Define if you have the <pwd.h> header file.  */
-#undef HAVE_PWD_H
+#define HAVE_PWD_H 1
 
 /* Define if you have the <grp.h> header file.  */
-#undef HAVE_GRP_H
+#define HAVE_GRP_H 1
 
 /* Define if you have the <stdint.h> header file.  */
-#undef HAVE_STDINT_H
+#define HAVE_STDINT_H 1
 
 /* Define if you have the <sys/types.h> header file.  */
-#undef HAVE_SYS_TYPES_H
-
-/* Define if you have the <poll.h> header file.  */
-#undef HAVE_POLL_H
+#define HAVE_SYS_TYPES_H 1
 
 /* Define if you have the <sys/poll.h> header file.  */
-#undef HAVE_SYS_POLL_H
+#define HAVE_SYS_POLL_H 1
 
 /* Define if you have the <sys/socket.h> header file.  */
-#undef HAVE_SYS_SOCKET_H
+#define HAVE_SYS_SOCKET_H 1
 
 /* Define if you have the <sys/uio.h> header file.  */
-#undef HAVE_SYS_UIO_H
+#define HAVE_SYS_UIO_H 1
 
 /* Define if you have the <sys/stat.h> header file.  */
-#undef HAVE_SYS_STAT_H
+#define HAVE_SYS_STAT_H 1
 
 /* Define if you have the <netdb.h> header file.  */
-#undef HAVE_NETDB_H
+#define HAVE_NETDB_H 1
 
 /* Define if you have the <sys/un.h> header file.  */
-#undef HAVE_SYS_UN_H
+#define HAVE_SYS_UN_H 1
 
 /* Define if you have the <pty.h> header file.  */
-#undef HAVE_PTY_H
+/* #undef HAVE_PTY_H */
 
 /* Define if you have the <netinet/in.h> header file.  */
-#undef HAVE_NETINET_IN_H
+#define HAVE_NETINET_IN_H 1
 
 /* Define if you have the <netinet/in_systm.h> header file.  */
-#undef HAVE_NETINET_IN_SYSTM_H
+#define HAVE_NETINET_IN_SYSTM_H 1
 
 /* Define if you have the <netinet/ip.h> header file.  */
-#undef HAVE_NETINET_IP_H
+#define HAVE_NETINET_IP_H 1
 
 /* Define if you have the <netinet/tcp.h> header file.  */
-#undef HAVE_NETINET_TCP_H
+#define HAVE_NETINET_TCP_H 1
 
 /* Define if you have the <netinet/ip6.h> header file.  */
-#undef HAVE_NETINET_IP6_H
-
-/* Define if you have the <netinet6/in6.h> header file.  */
-#undef HAVE_NETINET6_IN6_H
+#define HAVE_NETINET_IP6_H 1
 
 /* Define if you have the <arpa/nameser.h> header file.  */
-#undef HAVE_ARPA_NAMESER_H
+#define HAVE_ARPA_NAMESER_H 1
 
 /* Define if you have the <resolv.h> header file.  */
-#undef HAVE_RESOLV_H
+#define HAVE_RESOLV_H 1
 
 /* Define if you have the <termios.h> header file.  */
-#undef HAVE_TERMIOS_H
+#define HAVE_TERMIOS_H 1
 
 /* Define if you have the <net/if.h> header file.  */
-#undef HAVE_NET_IF_H
+#define HAVE_NET_IF_H 1
 
 /* Define if you have the <net/if_dl.h> header file.  */
-#undef HAVE_NET_IF_DL_H
+#define HAVE_NET_IF_DL_H 1
 
 /* Define if you have the <linux/types.h> header file.  */
-#undef HAVE_LINUX_TYPES_H
+/* #undef HAVE_LINUX_TYPES_H */
 
 /* Define if you have the <linux/errqueue.h> header file.  */
-#undef HAVE_LINUX_ERRQUEUE_H
+/* #undef HAVE_LINUX_ERRQUEUE_H */
 
 /* Define if you have the <linux/if_tun.h> header file.  */
-#undef HAVE_LINUX_IF_TUN_H
+/* #undef HAVE_LINUX_IF_TUN_H */
 
 /* Define if you have the <netpacket/packet.h> header file.  */
-#undef HAVE_NETPACKET_PACKET_H
+/* #undef HAVE_NETPACKET_PACKET_H */
 
 /* Define if you have the <netinet/if_ether.h> header file.  */
-#undef HAVE_NETINET_IF_ETHER_H
+/* #undef HAVE_NETINET_IF_ETHER_H */
 
 /* Define if you have the <sys/utsname.h> header file.  */
-#undef HAVE_SYS_UTSNAME_H
+#define HAVE_SYS_UTSNAME_H 1
 
 /* Define if you have the <sys/select.h> header file. (AIX) */
-#undef HAVE_SYS_SELECT_H
+#define HAVE_SYS_SELECT_H 1
 
 /* Define if you have the <sys/file.h> header file. (AIX) */
-#undef HAVE_SYS_FILE_H
+#define HAVE_SYS_FILE_H 1
 
 /* Define if you have the <util.h> header file. (NetBSD, OpenBSD: openpty()) */
-#undef HAVE_UTIL_H
-
-/* Define if you have the <bsd/libutil.h> header file. */
-#undef HAVE_BSD_LIBUTIL_H
+#define HAVE_UTIL_H 1
 
 /* Define if you have the <libutil.h> header file. (FreeBSD: openpty()) */
-#undef HAVE_LIBUTIL_H
+/* #undef HAVE_LIBUTIL_H */
 
 /* Define if you have the <sys/stropts.h> header file. (stream opts on SunOS)*/
-#undef HAVE_SYS_STROPTS_H
+/* #undef HAVE_SYS_STROPTS_H */
 
 /* Define if you have the <regex.h> header file. */
-#undef HAVE_REGEX_H
+#define HAVE_REGEX_H 1
 
 /* Define if you have the <linux/fs.h> header file. */
-#undef HAVE_LINUX_FS_H
+/* #undef HAVE_LINUX_FS_H */
 
 /* Define if you have the <linux/ext2_fs.h> header file. */
-#undef HAVE_LINUX_EXT2_FS_H
+/* #undef HAVE_LINUX_EXT2_FS_H */
 
 /* Define if you have the <readline/readline.h> header file. */
-#undef HAVE_READLINE_READLINE_H
+/* #undef HAVE_READLINE_READLINE_H */
 
 /* Define if you have the <readline/history.h> header file. */
-#undef HAVE_READLINE_HISTORY_H
+/* #undef HAVE_READLINE_HISTORY_H */
 
 /* Define if you have the readline library. */
-#undef HAVE_LIBREADLINE
+/* #undef HAVE_LIBREADLINE */
 
 /* Define if you have the m library (-lm).  */
-#undef HAVE_LIBM
+/* #undef HAVE_LIBM */
 
 /* Define if you have the floor function */
-#undef HAVE_FLOOR
+/* #undef HAVE_FLOOR */
 
 /* some platforms need _XOPEN_EXTENDED_SOURCE to get syslog headers (AIX4.1) */
-#undef _XOPEN_EXTENDED_SOURCE
+/* #undef _XOPEN_EXTENDED_SOURCE */
 
 /* fdset may have component fds_bits or __fds_bits */
-#undef HAVE_FDS_BITS
+#define HAVE_FDS_BITS 1
 
 /* Define if you have the sa_family_t */
-#undef HAVE_TYPE_SA_FAMILY_T
+#define HAVE_TYPE_SA_FAMILY_T 1
 
 /* define if your struct sigaction has sa_sigaction */
-#undef HAVE_STRUCT_SIGACTION_SA_SIGACTION
-
-/* define if you have struct sock_extended_err */
-#undef HAVE_STRUCT_SOCK_EXTENDED_ERR
+#define HAVE_STRUCT_SIGACTION_SA_SIGACTION 1
 
 /* Define if your struct termios has component c_ispeed */
-#undef HAVE_TERMIOS_ISPEED
+#define HAVE_TERMIOS_ISPEED 1
 
 /* the offset of c_ispeed in struct termios - usable in an speed_t array.
    Applies only when HAVE_TERMIOS_ISPEED is set */
-#undef ISPEED_OFFSET
+#define ISPEED_OFFSET 9
 
 /* the offset of c_ospeed in struct termios - see ISPEED_OFFSET */
 #ifdef ISPEED_OFFSET
 #  define OSPEED_OFFSET (ISPEED_OFFSET+1)
 #else
-#  undef OSPEED_OFFSET
+/* #  undef OSPEED_OFFSET */
 #endif
 
 /* Define if your termios.h likes _SVID3 defined */
-#undef _SVID3
-
-/* Define if your sys/socket.h likes _XPG4_2 defined */
-#undef _XPG4_2
-
-/* Define if your ctime_r() choices need _POSIX_PTHREAD_SEMANTICS */
-#undef _POSIX_PTHREAD_SEMANTICS
-
-/* Define if you need __EXTENSIONS__ */
-#undef __EXTENSIONS__
+/* #undef _SVID3 */
 
 /* Define if you have struct timespec (e.g. for nanosleep) */
-#undef HAVE_STRUCT_TIMESPEC
+#define HAVE_STRUCT_TIMESPEC 1
 
 /* Define if you have struct linger */
-#undef HAVE_STRUCT_LINGER
+#define HAVE_STRUCT_LINGER 1
 
 /* Define if you have struct ip_mreq */
-#undef HAVE_STRUCT_IP_MREQ
+#define HAVE_STRUCT_IP_MREQ 1
 
 /* Define if you have struct ip_mreqn */
-#undef HAVE_STRUCT_IP_MREQN
+/* #undef HAVE_STRUCT_IP_MREQN */
 
 /* Define if you have struct ipv6_mreq */
-#undef HAVE_STRUCT_IPV6_MREQ
+#define HAVE_STRUCT_IPV6_MREQ 1
 
 /* Define if you have struct ifreq */
-#undef HAVE_STRUCT_IFREQ
+#define HAVE_STRUCT_IFREQ 1
 
 /* Define if you have struct ifreq.ifr_index */
-#undef HAVE_STRUCT_IFREQ_IFR_INDEX
+/* #undef HAVE_STRUCT_IFREQ_IFR_INDEX */
 
 /* Define if you have struct ifreq.ifr_ifindex; not on HPUX */
-#undef HAVE_STRUCT_IFREQ_IFR_IFINDEX
+/* #undef HAVE_STRUCT_IFREQ_IFR_IFINDEX */
 
 /* Define if your struct sockaddr has sa_len */
-#undef HAVE_STRUCT_SOCKADDR_SALEN
+#define HAVE_STRUCT_SOCKADDR_SALEN 1
 
 /* there are several implementations of sockaddr_in6 */
-#undef HAVE_IP6_SOCKADDR
+#define HAVE_IP6_SOCKADDR 0
 
 /* Define if you have struct iovec */
-#undef HAVE_STRUCT_IOVEC
+#define HAVE_STRUCT_IOVEC 1
 
 /* define if your struct msghdr has msg_control */
-#undef HAVE_STRUCT_MSGHDR_MSGCONTROL
+#define HAVE_STRUCT_MSGHDR_MSGCONTROL 1
 
 /* define if your struct msghdr has msg_controllen */
-#undef HAVE_STRUCT_MSGHDR_MSGCONTROLLEN
+#define HAVE_STRUCT_MSGHDR_MSGCONTROLLEN 1
 
 /* define if your struct msghdr has msg_flag */
-#undef HAVE_STRUCT_MSGHDR_MSGFLAGS
+#define HAVE_STRUCT_MSGHDR_MSGFLAGS 1
 
 /* define if you have struct cmsghdr */
-#undef HAVE_STRUCT_CMSGHDR
+#define HAVE_STRUCT_CMSGHDR 1
 
 /* define if you have struct in_pktinfo */
-#undef HAVE_STRUCT_IN_PKTINFO
-
-/* define if your struct in_pktinfo has component ipi_spec_dst */
-#undef HAVE_PKTINFO_IPI_SPEC_DST
-
-/* define if you have struct in6_pktinfo */
-#undef HAVE_STRUCT_IN6_PKTINFO
+/* #undef HAVE_STRUCT_IN_PKTINFO */
 
 /* define if your struct ip has ip_hl; otherwise assume ip_vhl */
-#undef HAVE_STRUCT_IP_IP_HL
+#define HAVE_STRUCT_IP_IP_HL 1
 
 /* Define if you have the setenv function */
-#undef HAVE_SETENV
+#define HAVE_SETENV 1
 
 /* Define if you have the unsetenv function. not on HP-UX */
-#undef HAVE_UNSETENV
-
-/* Define if you have the SSLv2 client and server method functions. not in new openssl */
-#undef HAVE_SSLv2_client_method
-#undef HAVE_SSLv2_server_method
-
-/* Define if you have the HAVE_SSL_CTX_set_default_verify_paths function */
-#undef HAVE_SSL_CTX_set_default_verify_paths
-
-/* Define if you have the SSLv3 client and server method functions. not in new openssl */
-#undef HAVE_SSLv3_client_method
-#undef HAVE_SSLv3_server_method
-
-/* Define if you have the SSLv3 client and server method functions with rollback to v2 */
-#undef HAVE_SSLv23_client_method
-#undef HAVE_SSLv23_server_method
-
-/* Define if you have the TLSv1.0 client and server method functions */
-#undef HAVE_TLSv1_client_method
-#undef HAVE_TLSv1_server_method
-
-/* Define if you have the TLSv1.1 client and server method functions */
-#undef HAVE_TLSv1_1_client_method
-#undef HAVE_TLSv1_1_server_method
-
-/* Define if you have the TLSv1.2 client and server method functions */
-#undef HAVE_TLSv1_2_client_method
-#undef HAVE_TLSv1_2_server_method
-
-/* Define if you have the DTLSv1 client and server method functions */
-#undef HAVE_DTLSv1_client_method
-#undef HAVE_DTLSv1_server_method
+#define HAVE_UNSETENV 1
 
 /* Define if you have the flock function */
-#undef HAVE_FLOCK
+#define HAVE_FLOCK 1
 
 /* Define if you have the openpty function */
-#undef HAVE_OPENPTY
+#define HAVE_OPENPTY 1
 
 /* Define if you have the grantpt function */
-#undef HAVE_GRANTPT
+#define HAVE_GRANTPT 1
 
 /* Define if you have the unlockpt function */
-#undef HAVE_UNLOCKPT
+#define HAVE_UNLOCKPT 1
 
 /* Define if you have the ptsname function */
-#undef HAVE_PROTOTYPE_LIB_ptsname
+#define HAVE_PTSNAME 1
 
 /* Define if you have the /dev/ptmx pseudo terminal multiplexer */
-#undef HAVE_DEV_PTMX
+#define HAVE_DEV_PTMX 1
 
 /* Define if you have the /dev/ptc pseudo terminal multiplexer */
-#undef HAVE_DEV_PTC
-
-/* Define if you have the cfmakeraw() function */
-#undef HAVE_CFMAKERAW
+/* #undef HAVE_DEV_PTC */
 
 /* Define if you have the long long type */
-#undef HAVE_TYPE_LONGLONG
-
-/* is sig_atomic_t declared */
-#undef HAVE_TYPE_SIG_ATOMIC_T
-
-/* is bool already typedef'd? */
-#undef HAVE_TYPE_BOOL
+#define HAVE_TYPE_LONGLONG 1
 
 /* is socklen_t already typedef'd? */
-#undef HAVE_TYPE_SOCKLEN
+#define HAVE_TYPE_SOCKLEN 1
 
 /* Define if you have the struct stat64 type */
-#undef HAVE_TYPE_STAT64
+/* #undef HAVE_TYPE_STAT64 */
 
 /* Define if you have the struct off64_t type */
-#undef HAVE_TYPE_OFF64
+/* #undef HAVE_TYPE_OFF64 */
 
 /* is sighandler_t already typedef'd? */
-#undef HAVE_TYPE_SIGHANDLER
+/* #undef HAVE_TYPE_SIGHANDLER */
 
 /* is uint8_t already defined? */
-#undef HAVE_TYPE_UINT8
+#define HAVE_TYPE_UINT8 1
 
 /* is uint16_t already defined? */
-#undef HAVE_TYPE_UINT16
+#define HAVE_TYPE_UINT16 1
 
 /* is uint32_t already defined? */
-#undef HAVE_TYPE_UINT32
+#define HAVE_TYPE_UINT32 1
 
 /* is uint64_t already defined? */
-#undef HAVE_TYPE_UINT64
-
-/* Define if snprintf() returns required len on truncation (C-99 conform) */
-#undef HAVE_C99_SNPRINTF
+#define HAVE_TYPE_UINT64 1
 
 /* Define if you have the printf "Z" modifier */
-#undef HAVE_FORMAT_Z
+/* #undef HAVE_FORMAT_Z */
 
 /* Define the shift offset of the CRDLY mask */
-#undef CRDLY_SHIFT
+#define CRDLY_SHIFT -1
 
 /* Define the shift offset of the TABDLY mask */
-#undef TABDLY_SHIFT
+#define TABDLY_SHIFT -1
 
 /* Define the shift offset of the CSIZE mask */
-#undef CSIZE_SHIFT
+#define CSIZE_SHIFT 8
 
 /* Define if you have tcpwrappers (libwrap, tcpd) and it declares hosts_allow_table */
-#undef HAVE_HOSTS_ALLOW_TABLE
+#define HAVE_HOSTS_ALLOW_TABLE 1
 #if defined(HAVE_HOSTS_ALLOW_TABLE) && HAVE_HOSTS_ALLOW_TABLE
 #   define HAVE_HOSTS_DENY_TABLE 1
 #else
-#   undef HAVE_HOSTS_DENY_TABLE
+/* #   undef HAVE_HOSTS_DENY_TABLE */
 #endif
 
 /* 1..short, 3..int, 5..long; 2,4,6..unsigned */
-#undef HAVE_BASIC_SIZE_T
-#undef HAVE_BASIC_MODE_T
-#undef HAVE_BASIC_PID_T
-#undef HAVE_BASIC_UID_T
-#undef HAVE_BASIC_GID_T
-#undef HAVE_BASIC_TIME_T
-#undef HAVE_BASIC_OFF_T
-#undef HAVE_BASIC_OFF64_T
-#undef HAVE_BASIC_DEV_T
+#define HAVE_BASIC_SIZE_T 4 /* unsigned int */
+#define HAVE_BASIC_MODE_T 4 /* unsigned int */
+#define HAVE_BASIC_PID_T 3 /* int */
+#define HAVE_BASIC_UID_T 4 /* unsigned int */
+#define HAVE_BASIC_GID_T 4 /* unsigned int */
+#define HAVE_BASIC_TIME_T 5 /* long */
+#define HAVE_BASIC_OFF64_T 0 /* unknown, taking default */
 
-#undef HAVE_BASIC_SOCKLEN_T
+#define HAVE_BASIC_SOCKLEN_T 4 /* unsigned int */
 
-#undef HAVE_TYPEOF_ST_INO
-#undef HAVE_TYPEOF_ST_NLINK
-#undef HAVE_TYPEOF_ST_SIZE
-#undef HAVE_TYPEOF_ST_BLKSIZE
-#undef HAVE_TYPEOF_ST_BLOCKS
+#define HAVE_TYPEOF_ST_DEV 4 /* unsigned int */
+#define HAVE_TYPEOF_ST_INO 8 /* unsigned long long */
+#define HAVE_TYPEOF_ST_NLINK 4 /* unsigned int */
+#define HAVE_TYPEOF_ST_SIZE 7 /* long long */
+#define HAVE_TYPEOF_ST_BLKSIZE 4 /* unsigned int */
+#define HAVE_TYPEOF_ST_BLOCKS 7 /* long long */
 
-#undef HAVE_TYPEOF_ST64_DEV
-#undef HAVE_TYPEOF_ST64_INO
-#undef HAVE_TYPEOF_ST64_NLINK
-#undef HAVE_TYPEOF_ST64_SIZE
-#undef HAVE_TYPEOF_ST64_BLKSIZE
-#undef HAVE_TYPEOF_ST64_BLOCKS
+/* #undef HAVE_TYPEOF_ST64_DEV */
+/* #undef HAVE_TYPEOF_ST64_INO */
+/* #undef HAVE_TYPEOF_ST64_NLINK */
+/* #undef HAVE_TYPEOF_ST64_SIZE */
+/* #undef HAVE_TYPEOF_ST64_BLKSIZE */
+/* #undef HAVE_TYPEOF_ST64_BLOCKS */
 
-#undef HAVE_TYPEOF_STRUCT_TIMEVAL_TV_USEC
+#define HAVE_TYPEOF_STRUCT_TIMEVAL_TV_USEC 5 /* long */
 
-#undef HAVE_TYPEOF_RLIM_MAX
-
-#undef HAVE_TYPEOF_STRUCT_CMSGHDR_CMSG_LEN
+#define HAVE_TYPEOF_RLIM_MAX 7 /* long long */
 
 /* Define if you have the /proc filesystem */
-#undef HAVE_PROC_DIR
+#define HAVE_PROC_DIR 1
 
 /* Define if you have the /proc/$$/fd directories */
-#undef HAVE_PROC_DIR_FD
+/* #undef HAVE_PROC_DIR_FD */
 
-#undef HAVE_SETGRENT
-#undef HAVE_GETGRENT
-#undef HAVE_ENDGRENT
-#undef HAVE_GETGROUPLIST
-
-#undef WITH_HELP
-#undef WITH_STDIO
-#undef WITH_FDNUM
-#undef WITH_FILE
-#undef WITH_CREAT
-#undef WITH_GOPEN
-#undef WITH_TERMIOS
-#undef WITH_PIPE
-#undef WITH_UNIX
-#undef WITH_ABSTRACT_UNIXSOCKET
-#undef WITH_IP4
-#undef WITH_IP6
-#undef WITH_RAWIP
-#undef WITH_GENERICSOCKET
-#undef WITH_INTERFACE
-#undef WITH_TCP
-#undef WITH_UDP
-#undef WITH_SCTP
-#undef WITH_LISTEN
-#undef WITH_SOCKS4
-#undef WITH_SOCKS4A
-#undef WITH_PROXY
-#undef WITH_EXEC
-#undef WITH_SYSTEM
-#undef WITH_READLINE
-#undef WITH_TUN
-#undef WITH_PTY
-#undef WITH_EXT2
-#undef WITH_OPENSSL
+#define WITH_HELP 1
+#define WITH_STDIO 1
+#define WITH_FDNUM 1
+#define WITH_FILE 1
+#define WITH_CREAT 1
+#define WITH_GOPEN 1
+#define WITH_TERMIOS 1
+#define WITH_PIPE 1
+#define WITH_UNIX 1
+/* #undef WITH_ABSTRACT_UNIXSOCKET */
+#define WITH_IP4 1
+#define WITH_IP6 1
+#define WITH_RAWIP 1
+#define WITH_GENERICSOCKET 1
+/* #undef WITH_INTERFACE */
+#define WITH_TCP 1
+#define WITH_UDP 1
+/* #undef WITH_SCTP */
+#define WITH_LISTEN 1
+#define WITH_SOCKS4 1
+#define WITH_SOCKS4A 1
+#define WITH_PROXY 1
+#define WITH_EXEC 1
+#define WITH_SYSTEM 1
+/* #undef WITH_READLINE */
+/* #undef WITH_TUN */
+#define WITH_PTY 1
+#define WITH_EXT2 1
+#define WITH_OPENSSL 1
 #define WITH_STREAMS 1
-#undef WITH_FIPS
-#undef OPENSSL_FIPS
-#undef WITH_LIBWRAP
-#undef HAVE_TCPD_H
-#undef HAVE_LIBWRAP
+/* #undef WITH_FIPS */
+/* #undef OPENSSL_FIPS */
+#define WITH_LIBWRAP 1
+#define HAVE_TCPD_H 1
+#define HAVE_LIBWRAP 1
 
-#undef WITH_SYCLS
-#undef WITH_FILAN
-#undef WITH_RETRY
+#define WITH_SYCLS 1
+#define WITH_FILAN 1
+#define WITH_RETRY 1
 
-#undef WITH_MSGLEVEL
-
-#define BUILD_DATE __DATE__ " " __TIME__
+#define WITH_MSGLEVEL 0
 
 #endif /* !defined(__config_h_included) */

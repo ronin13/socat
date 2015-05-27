@@ -1,10 +1,13 @@
 /* source: sysincludes.h */
-/* Copyright Gerhard Rieger 2001-2011 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 #ifndef __sysincludes_h_included
 #define __sysincludes_h_included 1
 
+#if HAVE_STDBOOL_H
+#include <stdbool.h>	/* bool, true, false */
+#endif
 #if HAVE_INTTYPES_H
 #include <inttypes.h>	/* uint16_t */
 #endif
@@ -26,7 +29,7 @@
 #include <syslog.h>	/* openlog(), syslog(), closelog() */
 #endif
 #include <signal.h>	/* signal(), SIGPIPE, SIG_IGN */
-#include <time.h>	/* struct timeval, strftime() */
+#include <time.h>	/* struct timeval, strftime(), clock_gettime() */
 #if 0
 #include <sys/timeb.h>	/* struct timeb */
 #endif
@@ -54,7 +57,9 @@
 #if HAVE_SYS_TYPES_H
 #include <sys/types.h>	/* pid_t, select(), socket(), connect(), open(), u_short */
 #endif
-#if HAVE_SYS_POLL_H
+#if HAVE_POLL_H
+#include <poll.h>	/* poll() */
+#elif HAVE_SYS_POLL_H
 #include <sys/poll.h>	/* poll() */
 #endif
 #if HAVE_SYS_SOCKET_H
@@ -87,7 +92,7 @@
 #if HAVE_SYS_FILE_H
 #include <sys/file.h>	/* LOCK_EX, on AIX directly included */
 #endif
-#if _WITH_SOCKET
+#if WITH_IP4 || WITH_IP6
 #  if HAVE_NETINET_IN_H
 #include <netinet/in.h>	/* struct sockaddr_in, htonl() */
 #  endif

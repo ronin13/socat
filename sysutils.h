@@ -1,5 +1,5 @@
 /* source: sysutils.h */
-/* Copyright Gerhard Rieger 2001-2011 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 #ifndef __sysutils_h_included
@@ -74,7 +74,7 @@ extern const char *inet_ntop(int pf, const void *binaddr,
 #endif
 
 #if defined(HAVE_SETGRENT) && defined(HAVE_GETGRENT) && defined(HAVE_ENDGRENT)
-extern int getusergroups(const char *user, gid_t *list, size_t *ngroups);
+extern int getusergroups(const char *user, gid_t *list, int *ngroups);
 #endif
 
 #if !HAVE_HSTRERROR
@@ -88,10 +88,13 @@ extern int parseport(const char *portname, int proto);
 extern int ifindexbyname(const char *ifname, int anysock);
 extern int ifindex(const char *ifname, unsigned int *ifindex, int anysock);
 
-extern int xiosetenv(const char *varname, const char *value, int overwrite);
+extern int xiosetenv(const char *varname, const char *value, int overwrite, const char *sep);
 extern int
 xiosetenv2(const char *varname, const char *varname2, const char *value,
-	   int overwrite);
+	   int overwrite, const char *sep);
+extern int
+xiosetenv3(const char *varname, const char *varname2, const char *varname3,
+	   const char *value, int overwrite, const char *sep);
 extern int xiosetenvulong(const char *varname, unsigned long value,
 			  int overwrite);
 extern int xiosetenvushort(const char *varname, unsigned short value,

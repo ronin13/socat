@@ -1,5 +1,5 @@
 /* source: xio-ip4.c */
-/* Copyright Gerhard Rieger 2001-2008 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 /* this file contains the source for IP4 related functions */
@@ -20,7 +20,7 @@ int xioparsenetwork_ip4(const char *rangename, struct xiorange *range) {
    struct in_addr *netmask_in = &range->netmask.ip4.sin_addr;
    char *rangename1;	/* a copy of rangename with writing allowed */
    char *delimpos;	/* absolute address of delimiter */
-   int bits;
+   unsigned int bits;	/* netmask bits */
 
    if ((rangename1 = strdup(rangename)) == NULL) {
       Error1("strdup(\"%s\"): out of memory", rangename);
@@ -28,8 +28,20 @@ int xioparsenetwork_ip4(const char *rangename, struct xiorange *range) {
    }
 
    if (delimpos = strchr(rangename1, '/')) {
-      bits = strtoul(delimpos+1, NULL, 10);
-      netmask_in->s_addr = htonl((0xffffffff << (32-bits)));
+      char *endptr;
+      bits = strtoul(delimpos+1, &endptr, 10);
+      if (! ((*(delimpos+1) != '\0') && (*endptr == '\0'))) {
+	 Error1("not a valid netmask in \"%s\"", rangename);
+	 bits = 32;	/* most secure selection */
+      } else if (bits > 32) {
+	 Error1("netmask \"%s\" is too large", rangename);
+	 bits = 32;
+      }
+      if (bits <= 0) {
+	 netmask_in->s_addr = 0;
+      } else {
+	 netmask_in->s_addr = htonl((0xffffffff << (32-bits)));
+      }
    } else if (delimpos = strchr(rangename1, ':')) {
       if ((maskaddr = Gethostbyname(delimpos+1)) == NULL) {
 	 /* note: cast is req on AIX: */
@@ -55,7 +67,7 @@ int xioparsenetwork_ip4(const char *rangename, struct xiorange *range) {
 	    free(rangename1);
 	 return STAT_NORETRY;
       }
-      netaddr_in->s_addr = *(unsigned long *)nameaddr->h_addr_list[0];
+      netaddr_in->s_addr = *(uint32_t *)nameaddr->h_addr_list[0];
    }
    free(rangename1);
    return STAT_OK;
@@ -108,8 +120,7 @@ xiosetsockaddrenv_ip4(int idx, char *namebuff, size_t namelen,
    switch (idx) {
    case 0:
       strcpy(namebuff, "ADDR");
-      strcpy(valuebuff,
-	     inet4addr_info(ntohl(sa->sin_addr.s_addr), valuebuff, valuelen));
+      inet4addr_info(ntohl(sa->sin_addr.s_addr), valuebuff, valuelen);
       switch (ipproto) {
       case IPPROTO_TCP:
       case IPPROTO_UDP:

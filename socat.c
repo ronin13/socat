@@ -1,5 +1,5 @@
 /* source: socat.c */
-/* Copyright Gerhard Rieger 2001-2010 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 /* this is the main source, including command line option parsing, general
@@ -70,7 +70,7 @@ static int socat_newchild(void);
 static const char socatversion[] =
 #include "./VERSION"
       ;
-static const char timestamp[] = __DATE__" "__TIME__;
+static const char timestamp[] = BUILD_DATE;
 
 const char copyright_socat[] = "socat by Gerhard Rieger - see www.dest-unreach.org";
 #if WITH_OPENSSL
@@ -274,7 +274,7 @@ int main(int argc, const char *argv[]) {
    Info(copyright_ssleay);
 #endif
    Debug2("socat version %s on %s", socatversion, timestamp);
-   xiosetenv("VERSION", socatversion, 1);	/* SOCAT_VERSION */
+   xiosetenv("VERSION", socatversion, 1, NULL);	/* SOCAT_VERSION */
    uname(&ubuf);	/* ! here we circumvent internal tracing (Uname) */
    Debug4("running on %s version %s, release %s, machine %s\n",
 	   ubuf.sysname, ubuf.version, ubuf.release, ubuf.machine);
@@ -285,18 +285,23 @@ int main(int argc, const char *argv[]) {
    }
 #endif /* WITH_MSGLEVEL <= E_DEBUG */
 
-   /* not sure what signal should print a message */
-   Signal(SIGHUP, socat_signal);
-   Signal(SIGINT, socat_signal);
-   Signal(SIGQUIT, socat_signal);
-   Signal(SIGILL, socat_signal);
-   /* SIGABRT for assert; catching caused endless recursion on assert in libc
-      (tzfile.c:498: __tzfile_compute: Assertion 'num_types == 1' failed.) */
-   /*Signal(SIGABRT, socat_signal);*/
-   Signal(SIGBUS, socat_signal);
-   Signal(SIGFPE, socat_signal);
-   Signal(SIGSEGV, socat_signal);
-   Signal(SIGTERM, socat_signal);
+   {
+      struct sigaction act;
+      sigfillset(&act.sa_mask);
+      act.sa_flags = 0;
+      act.sa_handler = socat_signal;
+      /* not sure which signals should be cauhgt and print a message */
+      Sigaction(SIGHUP,  &act, NULL);
+      Sigaction(SIGINT,  &act, NULL);
+      Sigaction(SIGQUIT, &act, NULL);
+      Sigaction(SIGILL,  &act, NULL);
+      Sigaction(SIGABRT, &act, NULL);
+      Sigaction(SIGBUS,  &act, NULL);
+      Sigaction(SIGFPE,  &act, NULL);
+      Sigaction(SIGSEGV, &act, NULL);
+      Sigaction(SIGTERM, &act, NULL);
+   }
+   Signal(SIGPIPE, SIG_IGN);
 
    /* set xio hooks */
    xiohook_newchild = &socat_newchild;
@@ -546,12 +551,6 @@ int closing = 0;	/* 0..no eof yet, 1..first eof just occurred,
 int socat(const char *address1, const char *address2) {
    int mayexec;
 
-#if 1
-   if (Signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-      Warn1("signal(SIGPIPE, SIG_IGN): %s", strerror(errno));
-   }
-#endif
-
    if (socat_opts.lefttoright) {
       if ((sock1 = xioopen(address1, XIO_RDONLY|XIO_MAYFORK|XIO_MAYCHILD|XIO_MAYCONVERT)) == NULL) {
 	 return -1;
@@ -680,7 +679,9 @@ int childleftdata(xiofile_t *xfd) {
 	 in.revents = 0;
       }
       do {
+	 int _errno;
 	 retval = xiopoll(&in, 1, &timeout);
+	 _errno = errno; diag_flush(); errno = _errno;	/* just in case it's not debug level and Msg() not been called */
       } while (retval < 0 && errno == EINTR);
 
       if (retval < 0) {
@@ -789,6 +790,7 @@ int _socat(void) {
 	       if (total_timeout.tv_sec < 0 ||
 		   total_timeout.tv_sec == 0 && total_timeout.tv_usec < 0) {
 		  Notice("inactivity timeout triggered");
+		  free(buff);
 		  return 0;
 	       }
 	    }
@@ -901,6 +903,7 @@ int _socat(void) {
 		 fds[0].fd, fds[0].events, fds[1].fd, fds[1].events,
 		 fds[2].fd, fds[2].events, fds[3].fd, fds[3].events,
 		 timeout.tv_sec, timeout.tv_usec, strerror(errno));
+		  free(buff);
 	    return -1;
       } else if (retval == 0) {
 	 Info2("poll timed out (no data within %ld.%06ld seconds)",
@@ -912,6 +915,9 @@ int _socat(void) {
 	    if (XIO_RDSTREAM(sock1)->ignoreeof) {
 	       mayrd1 = 0;
 	    }
+	    if (XIO_RDSTREAM(sock2)->ignoreeof) {
+	       mayrd2 = 0;
+	    }
 	 } else if (polling && wasaction) {
 	    wasaction = 0;
 
@@ -919,6 +925,7 @@ int _socat(void) {
 		    socat_opts.total_timeout.tv_usec != 0) {
 	    /* there was a total inactivity timeout */
 	    Notice("inactivity timeout triggered");
+		  free(buff);
 	    return 0;
 	 }
 
@@ -937,6 +944,7 @@ int _socat(void) {
 	       named pipe. a read() might imm. return with 0 bytes, resulting
 	       in a loop? */ 
 	    Error1("poll(...[%d]: invalid request", fd1in->fd);
+		  free(buff);
 	    return -1;
 	 }
 	 mayrd1 = true;
@@ -945,6 +953,7 @@ int _socat(void) {
 	  (fd2in->revents)) {
 	 if (fd2in->revents & POLLNVAL) {
 	    Error1("poll(...[%d]: invalid request", fd2in->fd);
+		  free(buff);
 	    return -1;
 	 }
 	 mayrd2 = true;
@@ -952,6 +961,7 @@ int _socat(void) {
       if (XIO_GETWRFD(sock1) >= 0 && fd1out->fd >= 0 && fd1out->revents) {
 	 if (fd1out->revents & POLLNVAL) {
 	    Error1("poll(...[%d]: invalid request", fd1out->fd);
+		  free(buff);
 	    return -1;
 	 }
 	 maywr1 = true;
@@ -959,6 +969,7 @@ int _socat(void) {
       if (XIO_GETWRFD(sock2) >= 0 && fd2out->fd >= 0 && fd2out->revents) {
 	 if (fd2out->revents & POLLNVAL) {
 	    Error1("poll(...[%d]: invalid request", fd2out->fd);
+		  free(buff);
 	    return -1;
 	 }
 	 maywr2 = true;
@@ -1084,6 +1095,7 @@ int _socat(void) {
    xioclose(sock1);
    xioclose(sock2);
 
+		  free(buff);
    return 0;
 }
 
@@ -1405,6 +1417,10 @@ int cv_newline(unsigned char **buff, ssize_t *bufsiz,
 }
 
 void socat_signal(int signum) {
+   int _errno;
+   _errno = errno;
+   diag_in_handler = 1;
+   Notice1("socat_signal(): handling signal %d", signum);
    switch (signum) {
    case SIGQUIT:
    case SIGILL:
@@ -1423,7 +1439,11 @@ void socat_signal(int signum) {
    case SIGINT:
       Notice1("exiting on signal %d", signum); break;
    }
-   Exit(128+signum);
+   //Exit(128+signum);
+   Notice1("socat_signal(): finishing signal %d", signum);
+   diag_exit(128+signum);	/*!!! internal cleanup + _exit() */
+   diag_in_handler = 0;
+   errno = _errno;
 }
 
 /* this is the callback when the child of an address died */
@@ -1478,8 +1498,13 @@ static void socat_unlock(void) {
    if (!havelock)  return;
    if (socat_opts.lock.lockfile) {
       if (Unlink(socat_opts.lock.lockfile) < 0) {
-	 Warn2("unlink(\"%s\"): %s",
-	       socat_opts.lock.lockfile, strerror(errno));
+	 if (!diag_in_handler) {
+	    Warn2("unlink(\"%s\"): %s",
+	          socat_opts.lock.lockfile, strerror(errno));
+	 } else {
+	    Warn1("unlink(\"%s\"): "F_strerror,
+	          socat_opts.lock.lockfile);
+	 }
       } else {
 	 Info1("released lock \"%s\"", socat_opts.lock.lockfile);
       }

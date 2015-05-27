@@ -1,5 +1,5 @@
 /* source: sslcls.c */
-/* Copyright Gerhard Rieger 2001-2011 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 /* explicit system call and C library trace function, for those who miss strace
@@ -103,6 +103,62 @@ const SSL_METHOD *sycTLSv1_server_method(void) {
    return result;
 }
 
+#if HAVE_TLSv1_1_client_method
+const SSL_METHOD *sycTLSv1_1_client_method(void) {
+   const SSL_METHOD *result;
+   Debug("TLSv1_1_client_method()");
+   result = TLSv1_1_client_method();
+   Debug1("TLSv1_1_client_method() -> %p", result);
+   return result;
+}
+#endif
+
+#if HAVE_TLSv1_1_server_method
+const SSL_METHOD *sycTLSv1_1_server_method(void) {
+   const SSL_METHOD *result;
+   Debug("TLSv1_1_server_method()");
+   result = TLSv1_1_server_method();
+   Debug1("TLSv1_1_server_method() -> %p", result);
+   return result;
+}
+#endif
+
+#if HAVE_TLSv1_2_client_method
+const SSL_METHOD *sycTLSv1_2_client_method(void) {
+   const SSL_METHOD *result;
+   Debug("TLSv1_2_client_method()");
+   result = TLSv1_2_client_method();
+   Debug1("TLSv1_2_client_method() -> %p", result);
+   return result;
+}
+#endif
+
+#if HAVE_TLSv1_2_server_method
+const SSL_METHOD *sycTLSv1_2_server_method(void) {
+   const SSL_METHOD *result;
+   Debug("TLSv1_2_server_method()");
+   result = TLSv1_2_server_method();
+   Debug1("TLSv1_2_server_method() -> %p", result);
+   return result;
+}
+#endif
+
+const SSL_METHOD *sycDTLSv1_client_method(void) {
+   const SSL_METHOD *result;
+   Debug("DTLSv1_client_method()");
+   result = DTLSv1_client_method();
+   Debug1("DTLSv1_client_method() -> %p", result);
+   return result;
+}
+
+const SSL_METHOD *sycDTLSv1_server_method(void) {
+   const SSL_METHOD *result;
+   Debug("DTLSv1_server_method()");
+   result = DTLSv1_server_method();
+   Debug1("DTLSv1_server_method() -> %p", result);
+   return result;
+}
+
 SSL_CTX *sycSSL_CTX_new(const SSL_METHOD *method) {
    SSL_CTX *result;
    Debug1("SSL_CTX_new(%p)", method);
@@ -123,8 +179,8 @@ int sycSSL_CTX_load_verify_locations(SSL_CTX *ctx, const char *CAfile,
 				     const char *CApath) {
    int result;
    Debug7("SSL_CTX_load_verify_locations(%p, %s%s%s, %s%s%s)", ctx,
-	  CAfile?"\"":"", CAfile?CAfile:NULL, CAfile?"\"":"",
-	  CApath?"\"":"", CApath?CApath:NULL, CApath?"\"":"");
+	  CAfile?"\"":"", CAfile?CAfile:"", CAfile?"\"":"",
+	  CApath?"\"":"", CApath?CApath:"", CApath?"\"":"");
    result = SSL_CTX_load_verify_locations(ctx, CAfile, CApath);
    Debug1("SSL_CTX_load_verify_locations() -> %d", result);
    return result;

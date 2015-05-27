@@ -1,5 +1,5 @@
 /* source: xioopts.c */
-/* Copyright Gerhard Rieger 2001-2011 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 /* this file contains the source for address options handling */
@@ -277,6 +277,7 @@ const struct optname optionnames[] = {
 	IF_OPENSSL("capath",	&opt_openssl_capath)
 	IF_OPENSSL("cert",	&opt_openssl_certificate)
 	IF_OPENSSL("certificate",	&opt_openssl_certificate)
+	IF_TERMIOS("cfmakeraw",		&opt_termios_cfmakeraw)
 	IF_ANY    ("chroot",	&opt_chroot)
 	IF_ANY    ("chroot-early",	&opt_chroot_early)
 	/*IF_TERMIOS("cibaud",	&opt_cibaud)*/
@@ -290,6 +291,8 @@ const struct optname optionnames[] = {
 	IF_TERMIOS("clocal",	&opt_clocal)
 	IF_ANY    ("cloexec",	&opt_cloexec)
 	IF_ANY    ("close",	&opt_end_close)
+	IF_OPENSSL("cn",		&opt_openssl_commonname)
+	IF_OPENSSL("commonname",	&opt_openssl_commonname)
 #if WITH_EXT2 && defined(EXT2_COMPR_FL)
 	IF_ANY    ("compr",	&opt_ext2_compr)
 #endif
@@ -726,7 +729,9 @@ const struct optname optionnames[] = {
 #endif
 	IF_IP     ("iptos",	&opt_ip_tos)
 	IF_IP     ("ipttl",	&opt_ip_ttl)
+#ifdef IPV6_JOIN_GROUP
 	IF_IP6    ("ipv6-add-membership",	&opt_ipv6_join_group)
+#endif
 #ifdef IPV6_AUTHHDR
 	IF_IP6    ("ipv6-authhdr",	&opt_ipv6_authhdr)
 #endif
@@ -742,7 +747,9 @@ const struct optname optionnames[] = {
 #ifdef IPV6_HOPOPTS
 	IF_IP6    ("ipv6-hopopts",	&opt_ipv6_hopopts)
 #endif
+#ifdef IPV6_JOIN_GROUP
 	IF_IP6    ("ipv6-join-group",	&opt_ipv6_join_group)
+#endif
 #ifdef IPV6_PKTINFO
 	IF_IP6    ("ipv6-pktinfo",	&opt_ipv6_pktinfo)
 #endif
@@ -792,7 +799,9 @@ const struct optname optionnames[] = {
 	IF_TERMIOS("ixany",	&opt_ixany)
 	IF_TERMIOS("ixoff",	&opt_ixoff)
 	IF_TERMIOS("ixon",	&opt_ixon)
+#ifdef IPV6_JOIN_GROUP
 	IF_IP6    ("join-group",	&opt_ipv6_join_group)
+#endif
 #if WITH_EXT2 && defined(EXT2_JOURNAL_DATA_FL)
 	IF_ANY    ("journal",		&opt_ext2_journal_data)
 	IF_ANY    ("journal-data",	&opt_ext2_journal_data)
@@ -1088,6 +1097,7 @@ const struct optname optionnames[] = {
 	IF_OPENSSL("openssl-capath",	&opt_openssl_capath)
 	IF_OPENSSL("openssl-certificate",	&opt_openssl_certificate)
 	IF_OPENSSL("openssl-cipherlist",	&opt_openssl_cipherlist)
+	IF_OPENSSL("openssl-commonname",	&opt_openssl_commonname)
 #if OPENSSL_VERSION_NUMBER >= 0x00908000L
 	IF_OPENSSL("openssl-compress",	&opt_openssl_compress)
 #endif
@@ -1187,6 +1197,7 @@ const struct optname optionnames[] = {
 	IF_TERMIOS("quit",	&opt_vquit)
 	IF_RANGE  ("range",	&opt_range)
 	IF_TERMIOS("raw",	&opt_raw)
+	IF_TERMIOS("rawer",	&opt_termios_rawer)
 	IF_SOCKET ("rcvbuf",	&opt_so_rcvbuf)
 	IF_SOCKET ("rcvbuf-late",	&opt_so_rcvbuf_late)
 #ifdef SO_RCVLOWAT
@@ -1614,6 +1625,8 @@ const struct optname optionnames[] = {
 	IF_IPAPP  ("tcpwrapper",	&opt_tcpwrappers)
 	IF_IPAPP  ("tcpwrappers",	&opt_tcpwrappers)
 #endif
+	IF_TERMIOS("termios-cfmakeraw",	&opt_termios_cfmakeraw)
+	IF_TERMIOS("termios-rawer",	&opt_termios_rawer)
 #ifdef O_TEXT
 	IF_ANY    ("text",	&opt_o_text)
 #endif
@@ -1820,7 +1833,11 @@ int parseopts_table(const char **a, unsigned int groups, struct opt **opts,
       parsres =
 	 nestlex(a, &tokp, &len, endkey, hquotes, squotes, nests,
 		 true, true, false);
-      if (parsres != 0) {
+      if (parsres < 0) {
+	 Error1("option too long:  \"%s\"", *a);
+	 return -1;
+      } else if (parsres > 0) {
+	 Error1("syntax error in \"%s\"", *a);
 	 return -1;
       }
       if (tokp == token) {
@@ -1855,7 +1872,11 @@ int parseopts_table(const char **a, unsigned int groups, struct opt **opts,
 	 parsres =
 	    nestlex(a, &tokp, &len, endval, hquotes, squotes, nests,
 		    true, true, false);
-	 if (parsres != 0) {
+	 if (parsres < 0) {
+	    Error1("option too long:  \"%s\"", *a);
+	    return -1;
+	 } else if (parsres > 0) {
+	    Error1("syntax error in \"%s\"", *a);
 	    return -1;
 	 }
 	 *tokp = '\0';
@@ -2333,9 +2354,17 @@ int parseopts_table(const char **a, unsigned int groups, struct opt **opts,
 	    /* parse first IP address, expect ':' */
 	    tokp = token;
 	    /*! result= */
-	    nestlex((const char **)&tokp, &buffp, &bufspc,
-		    ends, NULL, NULL, nests,
-		    true, false, false);
+	    parsres =
+	       nestlex((const char **)&tokp, &buffp, &bufspc,
+		       ends, NULL, NULL, nests,
+		       true, false, false);
+	    if (parsres < 0) {
+	       Error1("option too long:  \"%s\"", *a);
+	       return -1;
+	    } else if (parsres > 0) {
+	       Error1("syntax error in \"%s\"", *a);
+	       return -1;
+	    }
 	    if (*tokp != ':') {
 	       Error1("syntax in option %s: missing ':'", token);
 	    }
@@ -2346,15 +2375,23 @@ int parseopts_table(const char **a, unsigned int groups, struct opt **opts,
 	    /* parse second IP address, expect ':' or '\0'' */
 	    buffp = buff;
 	    /*! result= */
-	    nestlex((const char **)&tokp, &buffp, &bufspc,
-		    ends, NULL, NULL, nests,
-		    true, false, false);
+	    parsres =
+	       nestlex((const char **)&tokp, &buffp, &bufspc,
+		       ends, NULL, NULL, nests,
+		       true, false, false);
+	    if (parsres < 0) {
+	       Error1("option too long:  \"%s\"", *a);
+	       return -1;
+	    } else if (parsres > 0) {
+	       Error1("syntax error in \"%s\"", *a);
+	       return -1;
+	    }
 	    *buffp++ = '\0';
 	    (*opts)[i].value.u_ip_mreq.param2 = strdup(buff); /*!!! NULL */
 
 #if HAVE_STRUCT_IP_MREQN	    
 	    if (*tokp++ == ':') {
-	       strncpy((*opts)[i].value.u_ip_mreq.ifindex, tokp, IF_NAMESIZE);
+	       strncpy((*opts)[i].value.u_ip_mreq.ifindex, tokp, IF_NAMESIZE);	/* ok */
 	       Info4("setting option \"%s\" to {\"%s\",\"%s\",\"%s\"}",
 		     ent->desc->defname,
 		     (*opts)[i].value.u_ip_mreq.multiaddr,
@@ -2386,9 +2423,17 @@ int parseopts_table(const char **a, unsigned int groups, struct opt **opts,
 	    char buff[512], *buffp=buff; size_t bufspc = sizeof(buff)-1;
 
 	    tokp = token;
+	    parsres =
 	    nestlex((const char **)&tokp, &buffp, &bufspc,
 		    ends, NULL, NULL, nests,
 		    true, false, false);
+	    if (parsres < 0) {
+	       Error1("option too long:  \"%s\"", *a);
+	       return -1;
+	    } else if (parsres > 0) {
+	       Error1("syntax error in \"%s\"", *a);
+	       return -1;
+	    }
 	    if (*tokp != '\0') {
 	       Error1("trailing data in option \"%s\"", token);
 	    }
@@ -2810,7 +2855,7 @@ int retropt_string(struct opt *opts, int optcode, char **result) {
 
 
 #if _WITH_SOCKET
-/* looks for an bind option and, if found, overwrites the complete contents of
+/* looks for a bind option and, if found, overwrites the complete contents of
    sa with the appropriate value(s).
    returns STAT_OK if option exists and could be resolved,
    STAT_NORETRY if option exists but had error,
@@ -2823,7 +2868,10 @@ int retropt_bind(struct opt *opts,
 		 struct sockaddr *sa,
 		 socklen_t *salen,
 		 int feats,	/* TCP etc: 1..address allowed,
-				   3..address and port allowed */
+					    3..address and port allowed
+				   UNIX (or'd): 1..tight
+						2..abstract
+				*/
 		 unsigned long res_opts0, unsigned long res_opts1) {
    const char portsep[] = ":";
    const char *ends[] = { portsep, NULL };
@@ -2832,6 +2880,7 @@ int retropt_bind(struct opt *opts,
    char *bindname, *bindp;
    char hostname[512], *hostp = hostname, *portp = NULL;
    size_t hostlen = sizeof(hostname)-1;
+   int parsres;
    int result;
 
    if (retropt_string(opts, OPT_BIND, &bindname) < 0) {
@@ -2865,8 +2914,16 @@ int retropt_bind(struct opt *opts,
    case AF_INET6:
 #endif /*WITH_IP6 */
       portallowed = (feats>=2);
-      nestlex((const char **)&bindp, &hostp, &hostlen, ends, NULL, NULL, nests,
-	      true, false, false);
+      parsres =
+	 nestlex((const char **)&bindp, &hostp, &hostlen, ends, NULL, NULL, nests,
+		 true, false, false);
+      if (parsres < 0) {
+	 Error1("option too long:  \"%s\"", bindp);
+	 return STAT_NORETRY;
+      } else if (parsres > 0) {
+	 Error1("syntax error in \"%s\"", bindp);
+	 return STAT_NORETRY;
+      }
       *hostp++ = '\0';
       if (!strncmp(bindp, portsep, strlen(portsep))) {
 	 if (!portallowed) {
@@ -2891,9 +2948,10 @@ int retropt_bind(struct opt *opts,
 #if WITH_UNIX
    case AF_UNIX:
       {
-	 bool tight = false;
+	 bool abstract = (feats&2);
+	 bool tight = (feats&1);
 	 struct sockaddr_un *s_un = (struct sockaddr_un *)sa;
-	 *salen = xiosetunix(af, s_un, bindname, false, tight);
+	 *salen = xiosetunix(af, s_un, bindname, abstract, tight);
       }
       break;
 #endif /* WITH_UNIX */
@@ -3046,7 +3104,7 @@ int applyopts(int fd, struct opt *opts, enum e_phase phase) {
 	       if (Setsockopt(fd, opt->desc->major, opt->desc->minor,
 			      opt->value.u_bin.b_data, opt->value.u_bin.b_len)
 		   < 0) {
-		  Error6("setsockopt(%d, %d, %d, %p, %d): %s",
+		  Error6("setsockopt(%d, %d, %d, %p, "F_Zu"): %s",
 			 fd, opt->desc->major, opt->desc->minor,
 			 opt->value.u_bin.b_data, opt->value.u_bin.b_len,
 			 strerror(errno));
@@ -3178,7 +3236,7 @@ int applyopts(int fd, struct opt *opts, enum e_phase phase) {
 	    if (Getsockopt(fd, opt->desc->major, opt->desc->minor,
 			   data, &oldlen)
 		< 0) {
-	       Error6("getsockopt(%d, %d, %d, %p, {"F_Zu"}): %s",
+	       Error6("getsockopt(%d, %d, %d, %p, {"F_socklen"}): %s",
 		      fd, opt->desc->major, opt->desc->minor, data, oldlen,
 		      strerror(errno));
 	       opt->desc = ODESC_ERROR; ++opt; continue;
@@ -3593,6 +3651,14 @@ int applyopts(int fd, struct opt *opts, enum e_phase phase) {
 	    termarg.c_cc[VMIN] = 1;
 	    termarg.c_cc[VTIME] = 0;
 	    break;
+	 case OPT_TERMIOS_RAWER:
+	    termarg.c_iflag = 0;
+	    termarg.c_oflag = 0;
+	    termarg.c_lflag = 0;
+	    termarg.c_cflag = (CS8);
+	    termarg.c_cc[VMIN] = 1;
+	    termarg.c_cc[VTIME] = 0;
+	    break;
 	 case OPT_SANE:
 	    /* cread -ignbrk brkint  -inlcr  -igncr  icrnl
               -ixoff  -iuclc  -ixany  imaxbel opost -olcuc -ocrnl
@@ -3679,6 +3745,19 @@ int applyopts(int fd, struct opt *opts, enum e_phase phase) {
 				 );
 	    termarg.c_lflag |= (ISIG|ICANON|IEXTEN|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE);
 	    /*! "sets characters to their default values... - which? */
+	    break;
+	 case OPT_TERMIOS_CFMAKERAW:
+#if HAVE_CFMAKERAW
+	    cfmakeraw(&termarg);
+#else
+	    /* these setting follow the Linux documenation of cfmakeraw */
+	    termarg.c_iflag &=
+	      ~(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|ICRNL|IXON);
+	    termarg.c_oflag &= ~(OPOST);
+	    termarg.c_lflag &= ~(ECHO|ECHONL|ICANON|ISIG|IEXTEN);
+	    termarg.c_cflag &= ~(CSIZE|PARENB);
+	    termarg.c_cflag |= (CS8);
+#endif
 	    break;
 	 default:
 	    Error("TERMIOS option not handled - internal error?");

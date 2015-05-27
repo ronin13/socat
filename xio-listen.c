@@ -147,14 +147,12 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
       return STAT_RETRYLATER;
    }
 
-   applyopts(xfd->fd, opts, PH_PASTSOCKET);
-
    applyopts_cloexec(xfd->fd, opts);
 
    applyopts(xfd->fd, opts, PH_PREBIND);
    applyopts(xfd->fd, opts, PH_BIND);
    if (Bind(xfd->fd, (struct sockaddr *)us, uslen) < 0) {
-      Msg4(level, "bind(%d, {%s}, "F_Zd"): %s", xfd->fd,
+      Msg4(level, "bind(%d, {%s}, "F_socklen"): %s", xfd->fd,
 	   sockaddr_info(us, uslen, infobuff, sizeof(infobuff)), uslen,
 	   strerror(errno));
       Close(xfd->fd);
@@ -206,6 +204,7 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
    retropt_bool(opts, OPT_LOWPORT, &xfd->para.socket.ip.lowport);
 #endif /* WITH_TCP || WITH_UDP */
 
+   applyopts(xfd->fd, opts, PH_PRELISTEN);
    retropt_int(opts, OPT_BACKLOG, &backlog);
    if (Listen(xfd->fd, backlog) < 0) {
       Error3("listen(%d, %d): %s", xfd->fd, backlog, strerror(errno));
@@ -238,11 +237,11 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
 	    continue;
 	 }
 	 if (errno == ECONNABORTED) {
-	    Notice4("accept(%d, %p, {"F_Zu"}): %s",
+	    Notice4("accept(%d, %p, {"F_socklen"}): %s",
 		    xfd->fd, &sa, salen, strerror(errno));
 	    continue;
 	 }
-	 Msg4(level, "accept(%d, %p, {"F_Zu"}): %s",
+	 Msg4(level, "accept(%d, %p, {"F_socklen"}): %s",
 	      xfd->fd, &sa, salen, strerror(errno));
 	 Close(xfd->fd);
 	 return STAT_RETRYLATER;
@@ -276,9 +275,6 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
 	 Info1("permitting connection from %s",
 	       sockaddr_info((struct sockaddr *)pa, pas,
 			     infobuff, sizeof(infobuff)));
-
-      applyopts(xfd->fd, opts, PH_FD);
-      applyopts(xfd->fd, opts, PH_CONNECTED);
 
       if (dofork) {
 	 pid_t pid;	/* mostly int; only used with fork */
@@ -332,7 +328,9 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
 	 while (maxchildren) {
 	    if (num_child < maxchildren) break;
 	    Notice("maxchildren are active, waiting");
-	    while (!Sleep(UINT_MAX)) ;	/* any signal lets us continue */
+	    /* UINT_MAX would even be nicer, but Openindiana works only
+	       with 31 bits */
+	    while (!Sleep(INT_MAX)) ;	/* any signal lets us continue */
 	 }
 	 Info("still listening");
       } else {
@@ -343,6 +341,10 @@ int _xioopen_listen(struct single *xfd, int xioflags, struct sockaddr *us, sockl
 	break;
       }
    }
+
+   applyopts(xfd->fd, opts, PH_FD);
+   applyopts(xfd->fd, opts, PH_PASTSOCKET);
+   applyopts(xfd->fd, opts, PH_CONNECTED);
    if ((result = _xio_openlate(xfd, opts)) < 0)
       return result;
 

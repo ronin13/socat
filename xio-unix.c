@@ -1,5 +1,5 @@
 /* source: xio-unix.c */
-/* Copyright Gerhard Rieger 2001-2010 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 /* this file contains the source for opening addresses of UNIX socket type */
@@ -57,13 +57,13 @@ const struct addrdesc xioaddr_abstract_recv    = { "abstract-recv",     1, xioop
 const struct addrdesc xioaddr_abstract_client  = { "abstract-client",   3, xioopen_unix_client,   GROUP_FD|GROUP_SOCKET|GROUP_SOCK_UNIX|GROUP_RETRY,                          1, 0, 0 HELP(":<filename>") };
 #endif /* WITH_ABSTRACT_UNIXSOCKET */
 
-const struct optdesc xioopt_unix_tightsocklen = { "unix-tightsocklen",    "tightsocklen",  OPT_UNIX_TIGHTSOCKLEN,  GROUP_SOCK_UNIX, PH_INIT, TYPE_BOOL, OFUNC_SPEC, 0, 0 };
+const struct optdesc xioopt_unix_tightsocklen = { "unix-tightsocklen",    "tightsocklen",  OPT_UNIX_TIGHTSOCKLEN,  GROUP_SOCK_UNIX, PH_PREBIND, TYPE_BOOL, OFUNC_OFFSET, XIO_OFFSETOF(para.socket.un.tight), XIO_SIZEOF(para.socket.un.tight) };
 
 
 /* fills the socket address struct and returns its effective length.
    abstract is usually 0;  != 0 generates an abstract socket address on Linux.
    tight!=0 calculates the resulting length from the path length, not from the
-   structures length; this is more common.
+   structures length; this is more common (see option unix-tightsocklen)
    the struct need not be initialized when calling this function.
 */
 socklen_t
@@ -83,7 +83,7 @@ xiosetunix(int pf,
 	       pathlen+1, sizeof(saun->sun_path));
       }
       saun->sun_path[0] = '\0';	/* so it's abstract */
-      strncpy(saun->sun_path+1, path, sizeof(saun->sun_path)-1);
+      strncpy(saun->sun_path+1, path, sizeof(saun->sun_path)-1);	/* ok */
       if (tight) {
 	 len = sizeof(struct sockaddr_un)-sizeof(saun->sun_path)+
 	    MIN(pathlen+1, sizeof(saun->sun_path));
@@ -101,7 +101,7 @@ xiosetunix(int pf,
       Warn2("unix socket address "F_Zu" characters long, truncating to "F_Zu"",
 	    pathlen, sizeof(saun->sun_path));
    }
-   strncpy(saun->sun_path, path, sizeof(saun->sun_path));
+   strncpy(saun->sun_path, path, sizeof(saun->sun_path));	/* ok */
    if (tight) {
       len = sizeof(struct sockaddr_un)-sizeof(saun->sun_path)+
 	 MIN(pathlen, sizeof(saun->sun_path));
@@ -124,7 +124,6 @@ static int xioopen_unix_listen(int argc, const char *argv[], struct opt *opts, i
    int protocol = 0;
    struct sockaddr_un us;
    socklen_t uslen;
-   bool tight = true;
    struct opt *opts0 = NULL;
    pid_t pid = Getpid();
    bool opt_unlink_early = false;
@@ -136,12 +135,10 @@ static int xioopen_unix_listen(int argc, const char *argv[], struct opt *opts, i
 	     argv[0], argc-1);
       return STAT_NORETRY;
    }
-
    name = argv[1];
-   retropt_socket_pf(opts, &pf);
-   retropt_bool(opts, OPT_UNIX_TIGHTSOCKLEN, &tight);
-   uslen = xiosetunix(pf, &us, name, abstract, tight);
 
+   xfd->para.socket.un.tight = true;
+   retropt_socket_pf(opts, &pf);
    xfd->howtoend = END_SHUTDOWN;
 
    if (!(ABSTRACT && abstract)) {
@@ -152,7 +149,11 @@ static int xioopen_unix_listen(int argc, const char *argv[], struct opt *opts, i
 
    if (applyopts_single(xfd, opts, PH_INIT) < 0) return STAT_NORETRY;
    applyopts(-1, opts, PH_INIT);
+   applyopts_named(name, opts, PH_EARLY);	/* umask! */
+   applyopts_offset(xfd, opts);
    applyopts(-1, opts, PH_EARLY);
+
+   uslen = xiosetunix(pf, &us, name, abstract, xfd->para.socket.un.tight);
 
    if (!(ABSTRACT && abstract)) {
       if (opt_unlink_early) {
@@ -163,15 +164,27 @@ static int xioopen_unix_listen(int argc, const char *argv[], struct opt *opts, i
 	       Error2("unlink(\"%s\"): %s", name, strerror(errno));
 	    }
 	 }
+      } else {
+	 struct stat buf;
+	 if (Lstat(name, &buf) == 0) {
+	    Error1("\"%s\" exists", name);
+	    return STAT_RETRYLATER;
+	 }
+      }
+      if (opt_unlink_close) {
+	 if ((xfd->unlink_close = strdup(name)) == NULL) {
+	    Error1("strdup(\"%s\"): out of memory", name);
+	 }
+	 xfd->opt_unlink_close = true;
       }
 
       /* trying to set user-early, perm-early etc. here is useless because
 	 file system entry is available only past bind() call. */
-      applyopts_named(name, opts, PH_EARLY);	/* umask! */
    }
 
    opts0 = copyopts(opts, GROUP_ALL);
 
+   /* this may fork() */
    if ((result =
 	xioopen_listen(xfd, xioflags,
 		       (struct sockaddr *)&us, uslen,
@@ -179,18 +192,15 @@ static int xioopen_unix_listen(int argc, const char *argv[], struct opt *opts, i
        != 0)
       return result;
 
-   /* we set this option as late as now because we should not remove an
-      existing entry when bind() failed */
    if (!(ABSTRACT && abstract)) {
       if (opt_unlink_close) {
-	 if (pid == Getpid()) {
-	    if ((xfd->unlink_close = strdup(name)) == NULL) {
-	       Error1("strdup(\"%s\"): out of memory", name);
-	    }
-	    xfd->opt_unlink_close = true;
+	 if (pid != Getpid()) {
+	    /* in a child process - do not unlink-close here! */
+	    xfd->opt_unlink_close = false;
 	 }
       }
    }
+
    return 0;
 }
 #endif /* WITH_LISTEN */
@@ -204,8 +214,7 @@ static int xioopen_unix_connect(int argc, const char *argv[], struct opt *opts, 
    int socktype = SOCK_STREAM;
    int protocol = 0;
    struct sockaddr_un them, us;
-   socklen_t themlen, uslen;
-   bool tight = true;
+   socklen_t themlen, uslen = sizeof(us);
    bool needbind = false;
    bool opt_unlink_close = false;
    int result;
@@ -215,19 +224,23 @@ static int xioopen_unix_connect(int argc, const char *argv[], struct opt *opts, 
 	     argv[0], argc-1);
       return STAT_NORETRY;
    }
-
-   xfd->howtoend = END_SHUTDOWN;
-
    name = argv[1];
+
+   xfd->para.socket.un.tight = true;
    retropt_socket_pf(opts, &pf);
-   retropt_bool(opts, OPT_UNIX_TIGHTSOCKLEN, &tight);
-   themlen = xiosetunix(pf, &them, name, abstract, tight);
+   xfd->howtoend = END_SHUTDOWN;
+   if (applyopts_single(xfd, opts, PH_INIT) < 0)  return STAT_NORETRY;
+   applyopts(-1, opts, PH_INIT);
+   applyopts_offset(xfd, opts);
+   applyopts(-1, opts, PH_EARLY);
+
+   themlen = xiosetunix(pf, &them, name, abstract, xfd->para.socket.un.tight);
    if (!(ABSTRACT && abstract)) {
       /* only for non abstract because abstract do not work in file system */
       retropt_bool(opts, OPT_UNLINK_CLOSE, &opt_unlink_close);
    }
-   if (retropt_bind(opts, pf, socktype, protocol, (struct sockaddr *)&us, &uslen, 0, 0, 0)
-       != STAT_NOACTION) {
+   if (retropt_bind(opts, pf, socktype, protocol, (struct sockaddr *)&us, &uslen,
+		    (abstract<<1)|xfd->para.socket.un.tight, 0, 0) == STAT_OK) {
       needbind = true;
    }
 
@@ -237,10 +250,6 @@ static int xioopen_unix_connect(int argc, const char *argv[], struct opt *opts, 
       }
       xfd->opt_unlink_close = true;
    }
-
-   if (applyopts_single(xfd, opts, PH_INIT) < 0)  return -1;
-   applyopts(-1, opts, PH_INIT);
-   applyopts(-1, opts, PH_EARLY);
 
    if ((result =
 	xioopen_connect(xfd,
@@ -264,8 +273,7 @@ static int xioopen_unix_sendto(int argc, const char *argv[], struct opt *opts, i
    int socktype = SOCK_DGRAM;
    int protocol = 0;
    union sockaddr_union us;
-   socklen_t uslen;
-   bool tight = true;
+   socklen_t uslen = sizeof(us);
    bool needbind = false;
    bool opt_unlink_close = false;
 
@@ -274,13 +282,14 @@ static int xioopen_unix_sendto(int argc, const char *argv[], struct opt *opts, i
 	     argv[0], argc-1);
       return STAT_NORETRY;
    }
-
-   retropt_bool(opts, OPT_UNIX_TIGHTSOCKLEN, &tight);
    name = argv[1];
-   retropt_socket_pf(opts, &pf);
-   xfd->salen = xiosetunix(pf, &xfd->peersa.un, name, abstract, tight);
 
+   xfd->para.socket.un.tight = true;
+   retropt_socket_pf(opts, &pf);
    xfd->howtoend = END_SHUTDOWN;
+   applyopts_offset(xfd, opts);
+
+   xfd->salen = xiosetunix(pf, &xfd->peersa.un, name, abstract, xfd->para.socket.un.tight);
 
    if (!(ABSTRACT && abstract)) {
       /* only for non abstract because abstract do not work in file system */
@@ -289,8 +298,8 @@ static int xioopen_unix_sendto(int argc, const char *argv[], struct opt *opts, i
 
    xfd->dtype = XIODATA_RECVFROM;
 
-   if (retropt_bind(opts, pf, socktype, protocol, &us.soa, &uslen, 0, 0, 0)
-       != STAT_NOACTION) {
+   if (retropt_bind(opts, pf, socktype, protocol, &us.soa, &uslen,
+		   (abstract<<1)| xfd->para.socket.un.tight, 0, 0) == STAT_OK) {
       needbind = true;
    }
 
@@ -323,7 +332,6 @@ int xioopen_unix_recvfrom(int argc, const char *argv[], struct opt *opts,
    int protocol = 0;
    struct sockaddr_un us;
    socklen_t uslen;
-   bool tight = true;
    bool needbind = true;
    bool opt_unlink_early = false;
    bool opt_unlink_close = true;
@@ -333,27 +341,32 @@ int xioopen_unix_recvfrom(int argc, const char *argv[], struct opt *opts,
 	     argv[0], argc-1);
       return STAT_NORETRY;
    }
-
    name = argv[1];
-   retropt_socket_pf(opts, &pf);
-   retropt_bool(opts, OPT_UNIX_TIGHTSOCKLEN, &tight);
-   uslen = xiosetunix(pf, &us, name, abstract, tight);
 
+   xfd->para.socket.un.tight = true;
+   retropt_socket_pf(opts, &pf);
    xfd->howtoend = END_NONE;
-   retropt_bind(opts, pf, socktype, protocol, (struct sockaddr *)&us, &uslen,
-		1, 0, 0);
+   if (applyopts_single(xfd, opts, PH_INIT) < 0)  return STAT_NORETRY;
+   applyopts(-1, opts, PH_INIT);
+   applyopts_named(name, opts, PH_EARLY);       /* umask! */
+   applyopts_offset(xfd, opts);
 
    if (!(ABSTRACT && abstract)) {
       /* only for non abstract because abstract do not work in file system */
       retropt_bool(opts, OPT_UNLINK_EARLY, &opt_unlink_early);
       retropt_bool(opts, OPT_UNLINK_CLOSE, &opt_unlink_close);
-      if (opt_unlink_close) {
-	 if ((xfd->unlink_close = strdup(name)) == NULL) {
-	    Error1("strdup(\"%s\"): out of memory", name);
-	 }
-	 xfd->opt_unlink_close = true;
-      }
+   }
+   applyopts(-1, opts, PH_EARLY);
 
+   uslen = xiosetunix(pf, &us, name, abstract, xfd->para.socket.un.tight);
+
+#if 0
+   if (retropt_bind(opts, pf, socktype, protocol, (struct sockaddr *)&us, &uslen,
+		    (abstract<<1)|xfd->para.socket.un.tight, 0, 0) == STAT_OK) {
+   }
+#endif
+
+   if (!(ABSTRACT && abstract)) {
       if (opt_unlink_early) {
 	 if (Unlink(name) < 0) {
 	    if (errno == ENOENT) {
@@ -362,12 +375,30 @@ int xioopen_unix_recvfrom(int argc, const char *argv[], struct opt *opts,
 	       Error2("unlink(\"%s\"): %s", name, strerror(errno));
 	    }
 	 }
+      } else {
+	 struct stat buf;
+	 if (Lstat(name, &buf) == 0) {
+	    Error1("\"%s\" exists", name);
+	    return STAT_RETRYLATER;
+	 }
       }
+      if (opt_unlink_close) {
+	 if ((xfd->unlink_close = strdup(name)) == NULL) {
+	    Error1("strdup(\"%s\"): out of memory", name);
+	 }
+	 xfd->opt_unlink_close = true;
+      }
+
+      /* trying to set user-early, perm-early etc. here is useless because
+	 file system entry is available only past bind() call. */
    }
+   applyopts_named(name, opts, PH_EARLY);	/* umask! */
 
    xfd->para.socket.la.soa.sa_family = pf;
 
    xfd->dtype = XIODATA_RECVFROM_ONE;
+
+   /* this may fork */
    return
       _xioopen_dgram_recvfrom(xfd, xioflags,
 			      needbind?(struct sockaddr *)&us:NULL, uslen,
@@ -387,7 +418,6 @@ int xioopen_unix_recv(int argc, const char *argv[], struct opt *opts,
    int protocol = 0;
    union sockaddr_union us;
    socklen_t uslen;
-   bool tight = true;
    bool opt_unlink_early = false;
    bool opt_unlink_close = true;
    int result;
@@ -397,19 +427,33 @@ int xioopen_unix_recv(int argc, const char *argv[], struct opt *opts,
 	     argv[0], argc-1);
       return STAT_NORETRY;
    }
-
    name = argv[1];
-   retropt_socket_pf(opts, &pf);
-   retropt_bool(opts, OPT_UNIX_TIGHTSOCKLEN, &tight);
-   uslen = xiosetunix(pf, &us.un, name, abstract, tight);
 
-#if 1	/*!!! why bind option? */
-   retropt_bind(opts, pf, socktype, protocol, &us.soa, &uslen, 1, 0, 0);
-#endif
+   xfd->para.socket.un.tight = true;
+   retropt_socket_pf(opts, &pf);
+   xfd->howtoend = END_SHUTDOWN;
+   if (applyopts_single(xfd, opts, PH_INIT) < 0)  return STAT_NORETRY;
+   applyopts(-1, opts, PH_INIT);
+   applyopts_named(name, opts, PH_EARLY);       /* umask! */
+   applyopts_offset(xfd, opts);
 
    if (!(ABSTRACT && abstract)) {
       /* only for non abstract because abstract do not work in file system */
       retropt_bool(opts, OPT_UNLINK_EARLY, &opt_unlink_early);
+      retropt_bool(opts, OPT_UNLINK_CLOSE, &opt_unlink_close);
+   }
+   applyopts(-1, opts, PH_EARLY);
+
+   uslen = xiosetunix(pf, &us.un, name, abstract, xfd->para.socket.un.tight);
+
+#if 0
+   if (retropt_bind(opts, pf, socktype, protocol, &us.soa, &uslen,
+		    (abstract<<1)|xfd->para.socket.un.tight, 0, 0)
+       == STAT_OK) {
+   }
+#endif
+
+   if (!(ABSTRACT && abstract)) {
       if (opt_unlink_early) {
 	 if (Unlink(name) < 0) {
 	    if (errno == ENOENT) {
@@ -418,10 +462,13 @@ int xioopen_unix_recv(int argc, const char *argv[], struct opt *opts,
 	       Error2("unlink(\"%s\"): %s", name, strerror(errno));
 	    }
 	 }
+      } else {
+	 struct stat buf;
+	 if (Lstat(name, &buf) == 0) {
+	    Error1("\"%s\" exists", name);
+	    return STAT_RETRYLATER;
+	 }
       }
-
-      retropt_bool(opts, OPT_UNLINK_CLOSE, &opt_unlink_close);
-
       if (opt_unlink_close) {
 	 if ((xfd->unlink_close = strdup(name)) == NULL) {
 	    Error1("strdup(\"%s\"): out of memory", name);
@@ -429,6 +476,7 @@ int xioopen_unix_recv(int argc, const char *argv[], struct opt *opts,
 	 xfd->opt_unlink_close = true;
       }
    }
+   applyopts_named(name, opts, PH_EARLY);	/* umask! */
 
    xfd->para.socket.la.soa.sa_family = pf;
 
@@ -467,28 +515,27 @@ _xioopen_unix_client(xiosingle_t *xfd, int xioflags, unsigned groups,
    int socktype = 0;	/* to be determined by server socket type */
    int protocol = 0;
    union sockaddr_union them, us;
-   socklen_t themlen, uslen;
-   bool tight = true;
+   socklen_t themlen, uslen = sizeof(us);
    bool needbind = false;
    bool opt_unlink_close = false;
    struct opt *opts0;
    int result;
 
-   if (applyopts_single(xfd, opts, PH_INIT) < 0)  return -1;
-   applyopts(-1, opts, PH_INIT);
-
-   xfd->howtoend = END_SHUTDOWN;
+   xfd->para.socket.un.tight = true;
    retropt_socket_pf(opts, &pf);
+   xfd->howtoend = END_SHUTDOWN;
+   if (applyopts_single(xfd, opts, PH_INIT) < 0)  return STAT_NORETRY;
+   applyopts(-1, opts, PH_INIT);
+   applyopts_offset(xfd, opts);
+   applyopts(-1, opts, PH_EARLY);
 
-   retropt_bool(opts, OPT_UNIX_TIGHTSOCKLEN, &tight);
-   themlen = xiosetunix(pf, &them.un, name, abstract, tight);
-
+   themlen = xiosetunix(pf, &them.un, name, abstract, xfd->para.socket.un.tight);
    if (!(ABSTRACT && abstract)) {
       /* only for non abstract because abstract do not work in file system */
       retropt_bool(opts, OPT_UNLINK_CLOSE, &opt_unlink_close);
    }
-
-   if (retropt_bind(opts, pf, socktype, protocol, &us.soa, &uslen, 0, 0, 0)
+   if (retropt_bind(opts, pf, socktype, protocol, &us.soa, &uslen,
+		    (abstract<<1)|xfd->para.socket.un.tight, 0, 0)
        != STAT_NOACTION) {
       needbind = true;
    }

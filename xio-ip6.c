@@ -1,5 +1,5 @@
 /* source: xio-ip6.c */
-/* Copyright Gerhard Rieger 2001-2011 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 /* this file contains the source for IP6 related functions */
@@ -20,7 +20,7 @@ static char *inet6addr_info(const struct in6_addr *sa, char *buff, size_t blen);
 
 
 #ifdef IPV6_V6ONLY
-const struct optdesc opt_ipv6_v6only = { "ipv6-v6only", "ipv6only", OPT_IPV6_V6ONLY, GROUP_SOCK_IP6, PH_PASTSOCKET, TYPE_BOOL, OFUNC_SOCKOPT, SOL_IPV6, IPV6_V6ONLY };
+const struct optdesc opt_ipv6_v6only = { "ipv6-v6only", "ipv6only", OPT_IPV6_V6ONLY, GROUP_SOCK_IP6, PH_PREBIND, TYPE_BOOL, OFUNC_SOCKOPT, SOL_IPV6, IPV6_V6ONLY };
 #endif
 #ifdef IPV6_JOIN_GROUP
 const struct optdesc opt_ipv6_join_group = { "ipv6-join-group", "join-group", OPT_IPV6_JOIN_GROUP, GROUP_SOCK_IP6, PH_PASTBIND, TYPE_IP_MREQN, OFUNC_SOCKOPT, SOL_IPV6, IPV6_JOIN_GROUP };
@@ -78,7 +78,8 @@ const struct optdesc opt_ipv6_recvpathmtu = { "ipv6-recvpathmtu", "recvpathmtu",
 int xioparsenetwork_ip6(const char *rangename, struct xiorange *range) {
    char *delimpos;	/* absolute address of delimiter */
    size_t delimind;	/* index of delimiter in string */
-   int bits;
+   unsigned int bits;	/* netmask bits */
+   char *endptr;
    char *baseaddr;
    union sockaddr_union sockaddr;
    socklen_t sockaddrlen = sizeof(sockaddr);
@@ -112,22 +113,32 @@ int xioparsenetwork_ip6(const char *rangename, struct xiorange *range) {
    rangeaddr->u6_addr32[1] = nameaddr->u6_addr32[1];
    rangeaddr->u6_addr32[2] = nameaddr->u6_addr32[2];
    rangeaddr->u6_addr32[3] = nameaddr->u6_addr32[3];
-   bits = strtoul(delimpos+1, NULL, 10);
-   if (bits > 128) {
-      Error1("invalid number of mask bits %u", bits);
-      return STAT_NORETRY;
+   bits = strtoul(delimpos+1, &endptr, 10);
+   if (! ((*(delimpos+1) != '\0') && (*endptr == '\0'))) {
+      Error1("not a valid netmask in \"%s\"", rangename);
+      bits = 128;	/* most secure selection */
+   } else if (bits > 128) {
+      Error1("netmask \"%s\" is too large", rangename);
+      bits = 128;
    }
-   if (bits < 32) {
+
+   /* I am starting to dislike C...uint32_t << 32 is undefined... */
+   if (bits == 0) {
+      rangemask->u6_addr32[0] = 0;
+      rangemask->u6_addr32[1] = 0;
+      rangemask->u6_addr32[2] = 0;
+      rangemask->u6_addr32[3] = 0;
+   } else if (bits <= 32) {
       rangemask->u6_addr32[0] = htonl(0xffffffff << (32-bits));
       rangemask->u6_addr32[1] = 0;
       rangemask->u6_addr32[2] = 0;
       rangemask->u6_addr32[3] = 0;
-   } else if (bits < 64) {
+   } else if (bits <= 64) {
       rangemask->u6_addr32[0] = 0xffffffff;
       rangemask->u6_addr32[1] = htonl(0xffffffff << (64-bits));
       rangemask->u6_addr32[2] = 0;
       rangemask->u6_addr32[3] = 0;
-   } else if (bits < 96) {
+   } else if (bits <= 96) {
       rangemask->u6_addr32[0] = 0xffffffff;
       rangemask->u6_addr32[1] = 0xffffffff;
       rangemask->u6_addr32[2] = htonl(0xffffffff << (96-bits));
@@ -199,7 +210,16 @@ int xiocheckrange_ip6(struct sockaddr_in6 *pa, struct xiorange *range) {
 
 
 #if defined(HAVE_STRUCT_CMSGHDR) && defined(CMSG_DATA)
-/* provides info about the ancillary message */
+/* provides info about the ancillary message:
+   converts the ancillary message in *cmsg into a form useable for further
+   processing. knows the specifics of common message types.
+   returns the number of resulting syntax elements in *num
+   returns a sequence of \0 terminated type strings in *typbuff
+   returns a sequence of \0 terminated name strings in *nambuff
+   returns a sequence of \0 terminated value strings in *valbuff
+   the respective len parameters specify the available space in the buffers
+   returns STAT_OK on success
+ */
 int xiolog_ancillary_ip6(struct cmsghdr *cmsg, int *num,
 			 char *typbuff, int typlen,
 			 char *nambuff, int namlen,
@@ -213,11 +233,11 @@ int xiolog_ancillary_ip6(struct cmsghdr *cmsg, int *num,
    msglen = cmsg->cmsg_len-((char *)CMSG_DATA(cmsg)-(char *)cmsg);
       envbuff[0] = '\0';
    switch (cmsg->cmsg_type) {
-#ifdef IPV6_PKTINFO
+#if defined(IPV6_PKTINFO) && HAVE_STRUCT_IN6_PKTINFO
    case IPV6_PKTINFO: {
       struct in6_pktinfo *pktinfo = (struct in6_pktinfo *)CMSG_DATA(cmsg);
       *num = 2;
-      strncpy(typbuff, "IPV6_PKTINFO", typlen);
+      typbuff[0] = '\0'; strncat(typbuff, "IPV6_PKTINFO", typlen-1);
       snprintf(nambuff, namlen, "%s%c%s", "dstaddr", '\0', "if");
       snprintf(envbuff, envlen, "%s%c%s", "IPV6_DSTADDR", '\0', "IPV6_IF");
       snprintf(valbuff, vallen, "%s%c%s",
@@ -225,59 +245,62 @@ int xiolog_ancillary_ip6(struct cmsghdr *cmsg, int *num,
 	       '\0', xiogetifname(pktinfo->ipi6_ifindex, scratch2, -1));
    }
       return STAT_OK;
-#endif /* defined(IPV6_PKTINFO) */
+#endif /* defined(IPV6_PKTINFO) && HAVE_STRUCT_IN6_PKTINFO */
 #ifdef IPV6_HOPLIMIT
    case IPV6_HOPLIMIT:
-      strncpy(typbuff, "IPV6_HOPLIMIT", typlen);
-      strncpy(nambuff, "hoplimit", namlen);
-      snprintf(valbuff, vallen, "%d", *(int *)CMSG_DATA(cmsg));
+      typbuff[0] = '\0'; strncat(typbuff, "IPV6_HOPLIMIT", typlen-1);
+      nambuff[0] = '\0'; strncat(nambuff, "hoplimit", namlen-1);
+      {
+	 int *intp = (int *)CMSG_DATA(cmsg);
+	 snprintf(valbuff, vallen, "%d", *intp);
+      }
       return STAT_OK;
 #endif /* defined(IPV6_HOPLIMIT) */
 #ifdef IPV6_RTHDR
    case IPV6_RTHDR:
-      strncpy(typbuff, "IPV6_RTHDR", typlen);
-      strncpy(nambuff, "rthdr", namlen);
+      typbuff[0] = '\0'; strncat(typbuff, "IPV6_RTHDR", typlen-1);
+      nambuff[0] = '\0'; strncat(nambuff, "rthdr", namlen-1);
       xiodump(CMSG_DATA(cmsg), msglen, valbuff, vallen, 0);
       return STAT_OK;
 #endif /* defined(IPV6_RTHDR) */
 #ifdef IPV6_AUTHHDR
    case IPV6_AUTHHDR:
-      strncpy(typbuff, "IPV6_AUTHHDR", typlen);
-      strncpy(nambuff, "authhdr", namlen);
+      typbuff[0] = '\0'; strncat(typbuff, "IPV6_AUTHHDR", typlen-1);
+      nambuff[0] = '\0'; strncat(nambuff, "authhdr", namlen-1);
       xiodump(CMSG_DATA(cmsg), msglen, valbuff, vallen, 0);
       return STAT_OK;
 #endif
 #ifdef IPV6_DSTOPTS
    case IPV6_DSTOPTS:
-      strncpy(typbuff, "IPV6_DSTOPTS", typlen);
-      strncpy(nambuff, "dstopts", namlen);
+      typbuff[0] = '\0'; strncat(typbuff, "IPV6_DSTOPTS", typlen-1);
+      nambuff[0] = '\0'; strncat(nambuff, "dstopts", namlen-1);
       xiodump(CMSG_DATA(cmsg), msglen, valbuff, vallen, 0);
       return STAT_OK;
 #endif /* defined(IPV6_DSTOPTS) */
 #ifdef IPV6_HOPOPTS
    case IPV6_HOPOPTS:
-      strncpy(typbuff, "IPV6_HOPOPTS", typlen);
-      strncpy(nambuff, "hopopts", namlen);
+      typbuff[0] = '\0'; strncat(typbuff, "IPV6_HOPOPTS", typlen-1);
+      nambuff[0] = '\0'; strncat(nambuff, "hopopts", namlen-1);
       xiodump(CMSG_DATA(cmsg), msglen, valbuff, vallen, 0);
       return STAT_OK;
 #endif /* defined(IPV6_HOPOPTS) */
 #ifdef IPV6_FLOWINFO
    case IPV6_FLOWINFO:
-      strncpy(typbuff, "IPV6_FLOWINFO", typlen);
-      strncpy(nambuff, "flowinfo", namlen);
+      typbuff[0] = '\0'; strncat(typbuff, "IPV6_FLOWINFO", typlen-1);
+      nambuff[0] = '\0'; strncat(nambuff, "flowinfo", namlen-1);
       xiodump(CMSG_DATA(cmsg), msglen, valbuff, vallen, 0);
       return STAT_OK;
 #endif
 #ifdef IPV6_TCLASS
    case IPV6_TCLASS:
-      strncpy(typbuff, "IPV6_TCLASS", typlen);
-      strncpy(nambuff, "tclass", namlen);
+      typbuff[0] = '\0'; strncat(typbuff, "IPV6_TCLASS", typlen-1);
+      nambuff[0] = '\0'; strncat(nambuff, "tclass", namlen-1);
       xiodump(CMSG_DATA(cmsg), msglen, valbuff, vallen, 0);
       return STAT_OK;
 #endif
    default:
       snprintf(typbuff, typlen, "IPV6.%u", cmsg->cmsg_type);
-      strncpy(nambuff, "data", namlen);
+      nambuff[0] = '\0'; strncat(nambuff, "data", namlen-1);
       xiodump(CMSG_DATA(cmsg), msglen, valbuff, vallen, 0);
       return STAT_OK;
    }
@@ -289,7 +312,7 @@ int xiolog_ancillary_ip6(struct cmsghdr *cmsg, int *num,
 /* convert the IP6 socket address to human readable form. buff should be at
    least 50 chars long. output includes the port number */
 static char *inet6addr_info(const struct in6_addr *sa, char *buff, size_t blen) {
-   if (snprintf(buff, blen, "[%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x]",
+   if (xio_snprintf(buff, blen, "[%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x]",
 #if HAVE_IP6_SOCKADDR==0
 		(sa->s6_addr[0]<<8)+sa->s6_addr[1],
 		(sa->s6_addr[2]<<8)+sa->s6_addr[3],
@@ -345,7 +368,7 @@ static char *inet6addr_info(const struct in6_addr *sa, char *buff, size_t blen) 
 		ntohs(((unsigned short *)&sa->__u6_addr.__u6_addr16)[6]),
 		ntohs(((unsigned short *)&sa->__u6_addr.__u6_addr16)[7])
 #endif
-		) < 0) {
+		) >= blen) {
       Warn("sockaddr_inet6_info(): buffer too short");
       buff[blen-1] = '\0';
    }

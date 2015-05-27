@@ -7,8 +7,8 @@
 
 # this script uses functions; you need a shell that supports them
 
-# you can pass general options to socat via $OPTS
-
+# you can pass general options to socat: export OPTS="-d -d -d -d -lu"
+# you can eg strace socat with: export TRACE="strace -v -tt -ff -D -x -s 1024 -o /tmp/$USER/socat.strace"
 #set -vx
 
 val_t=0.1
@@ -18,9 +18,9 @@ while [ "$1" ]; do
     case "X$1" in
 	X-t?*) val_t="${1#-t}" ;;
 	X-t)   shift; val_t="$1" ;;
-	X-n?*) NUMCOND="test \$N -eq ${1#-t}" ;;
+	X-n?*) NUMCOND="test \$N -eq ${1#-n}" ;;
 	X-n)   shift; NUMCOND="test \$N -eq $1" ;;
-	X-N?*) NUMCOND="test \$N -gt ${1#-t}" ;;
+	X-N?*) NUMCOND="test \$N -gt ${1#-N}" ;;
 	X-N)   shift; NUMCOND="test \$N -ge $1" ;;
 	*) break;
     esac
@@ -45,10 +45,16 @@ _MICROS=$((MICROS+999999)); SECONDs="${_MICROS%??????}"
 withroot=0	# perform privileged tests even if not run by root
 #PATH=$PATH:/opt/freeware/bin
 #PATH=$PATH:/usr/local/ssl/bin
+case "$0" in
+    */*) PATH="${0%/*}:$PATH"
+esac
 #OPENSSL_RAND="-rand /dev/egd-pool"
 #SOCAT_EGD="egd=/dev/egd-pool"
 MISCDELAY=1
 [ -z "$SOCAT" ] && SOCAT="./socat"
+if ! [ -x "$SOCAT" ] && ! type $SOCAT >/dev/null 2>&1; then
+    echo "$SOCAT does not exist" >&2; exit 1;
+fi
 [ -z "$PROCAN" ] && PROCAN="./procan"
 [ -z "$FILAN" ] && FILAN="./filan"
 opts="$opt_t $OPTS"
@@ -56,19 +62,75 @@ export SOCAT_OPTS="$opts"
 #debug="1"
 debug=
 TESTS="$@"; export TESTS
-INTERFACE=eth0;	# not used for function tests
+# for some tests we need a network interface
+if type ip >/dev/null 2>&1; then
+    INTERFACE=$(ip r get 8.8.8.8 |grep ' dev ' |head -n 1 |sed "s/.*dev[[:space:]][[:space:]]*\([^[:space:]][^[:space:]]*\).*/\1/")
+else
+    INTERFACE=eth0
+fi
 MCINTERFACE=lo	# !!! Linux only
 #LOCALHOST=192.168.58.1
-#LOCALHOST=localhost
-LOCALHOST=127.0.0.1
+LOCALHOST=localhost
+#LOCALHOST=127.0.0.1
 LOCALHOST6=[::1]
 #PROTO=$(awk '{print($2);}' /etc/protocols |sort -n |tail -n 1)
 #PROTO=$(($PROTO+1))
 PROTO=$((144+RANDOM/2048))
 PORT=12002
 SOURCEPORT=2002
+
+# SSL certificate contents
+TESTCERT_CONF=testcert.conf
+TESTCERT6_CONF=testcert6.conf
+#
+TESTCERT_COMMONNAME="$LOCALHOST"
+TESTCERT_COMMONNAME6="$LOCALHOST6"
+TESTCERT_COUNTRYNAME="XY"
+TESTCERT_LOCALITYNAME="Lunar Base"
+TESTCERT_ORGANIZATIONALUNITNAME="socat"
+TESTCERT_ORGANIZATIONNAME="dest-unreach"
+TESTCERT_SUBJECT="C = $TESTCERT_COUNTRYNAME, CN = $TESTCERT_COMMONNAME, O = $TESTCERT_ORGANIZATIONNAME, OU = $TESTCERT_ORGANIZATIONALUNITNAME, L = $TESTCERT_LOCALITYNAME"
+TESTCERT_ISSUER="C = $TESTCERT_COUNTRYNAME, CN = $TESTCERT_COMMONNAME, O = $TESTCERT_ORGANIZATIONNAME, OU = $TESTCERT_ORGANIZATIONALUNITNAME, L = $TESTCERT_LOCALITYNAME"
+cat >$TESTCERT_CONF <<EOF
+prompt=no
+
+[ req ]
+default_bits = 768
+distinguished_name=Test
+
+[ Test ]
+countryName=$TESTCERT_COUNTRYNAME
+commonName=$TESTCERT_COMMONNAME
+O=$TESTCERT_ORGANIZATIONNAME
+OU=$TESTCERT_ORGANIZATIONALUNITNAME
+L=$TESTCERT_LOCALITYNAME
+EOF
+
+cat >$TESTCERT6_CONF <<EOF
+prompt=no
+
+[ req ]
+default_bits = 768
+distinguished_name=Test
+
+[ Test ]
+countryName=$TESTCERT_COUNTRYNAME
+commonName=$TESTCERT_COMMONNAME6
+O=$TESTCERT_ORGANIZATIONNAME
+OU=$TESTCERT_ORGANIZATIONALUNITNAME
+L=$TESTCERT_LOCALITYNAME
+EOF
+
+# clean up from previous runs
+rm -f testcli.{crt,key,pem}
+rm -f testsrv.{crt,key,pem}
+rm -f testcli6.{crt,key,pem}
+rm -f testsrv6.{crt,key,pem}
+
+
 CAT=cat
 OD_C="od -c"
+
 # precision sleep; takes seconds with fractional part
 psleep () {
     local T="$1"
@@ -116,9 +178,18 @@ case "$UNAME" in
 #    ;;
 *)
     PTYOPTS="echo=0,opost=0"
-    PTYOPTS2="raw,echo=0"
+    #PTYOPTS2="raw,echo=0"
+    PTYOPTS2="cfmakeraw"
+    #PTYOPTS2="rawer"
     ;;
 esac
+
+# for some tests we need an unprivileged user id to su to
+if [ "$SUDO_USER" ]; then
+    SUBSTUSER="$SUDO_USER"
+else
+    SUBSTUSER="$(grep -v '^[^:]*:^[^:]*:0:' /etc/passwd |tail -n 1 |cut -d: -f1)"
+fi
 
 # non-root users might miss ifconfig in their path
 case "$UNAME" in
@@ -135,10 +206,32 @@ DragonFly) IFCONFIG=/sbin/ifconfig ;;
 *)     IFCONFIG=/sbin/ifconfig ;;
 esac
 
+# need output like "644"
+case "$UNAME" in
+    Linux) fileperms() { stat -L --print "%a\n" "$1" 2>/dev/null; } ;;
+    FreeBSD) fileperms() { stat -L -x "$1" |grep ' Mode:' |sed 's/.* Mode:[[:space:]]*([0-9]\([0-7][0-7][0-7]\).*/\1/'; } ;;
+    *) fileperms() {
+	    local p s=0 c
+	    p="$(ls -l -L "$1" |awk '{print($1);}')"
+	    p="${p:1:9}"
+	    while [ "$p" ]; do c=${p:0:1}; p=${p:1}; [ "x$c" == x- ]; let "s=2*s+$?"; done
+	    printf "%03o\n" $s;
+	} ;;
+esac
+
+# need user (owner) of filesystem entry
+case "$UNAME" in
+    Linux) fileuser() { stat -L --print "%U\n" "$tsock" 2>/dev/null; } ;;
+    FreeBSD) fileuser() { ls -l test.sh |awk '{print($3);}'; } ;;
+    *) fileuser() { ls -l test.sh |awk '{print($3);}'; } ;;
+esac
+
+
 # for some tests we need a second local IPv4 address
 case "$UNAME" in
 Linux)
-    BROADCASTIF=eth0
+    BROADCASTIF=$(ip r get 8.8.8.8 |grep ' dev ' |sed 's/.*\<dev[[:space:]][[:space:]]*\([a-z0-9][a-z0-9]*\).*/\1/')
+    [ -z "$BROADCASTIF" ] && BROADCASTIF=eth0
     SECONDADDR=127.1.0.1
     SECONDMASK=255.255.0.0
     BCADDR=127.255.255.255
@@ -208,7 +301,7 @@ ECHO="echo $E"
 PRINTF="printf"
 
 case "$TERM" in
-vt100|vt320|linux|xterm|cons25|dtterm|aixterm|sun-color|xterm-color)
+vt100|vt320|linux|xterm|cons25|dtterm|aixterm|sun-color|xterm-color|xterm-256color)
 	# there are different behaviours of printf (and echo)
 	# on some systems, echo behaves different than printf...
 	if [ $($PRINTF "\0101") = "A" ]; then
@@ -1488,6 +1581,7 @@ N=1
 numOK=0
 numFAIL=0
 numCANT=0
+listFAIL=
 
 #==============================================================================
 # test if selected socat features work ("FUNCTIONS")
@@ -1504,32 +1598,34 @@ testecho () {
     local tdiff="$td/test$N.diff"
     local da="test$N $(date) $RANDOM"
     if ! eval $NUMCOND; then :; else
-    #local cmd="$SOCAT $opts $arg1 $arg2"
+    #local cmd="$TRACE $SOCAT $opts $arg1 $arg2"
     #$ECHO "testing $title (test $N)... \c"
     $PRINTF "test $F_n %s... " $N "$title"
     #echo "$da" |$cmd >"$tf" 2>"$te"
-    (psleep $T; echo "$da"; psleep $T) |($SOCAT $opts "$arg1" "$arg2" >"$tf" 2>"$te"; echo $? >"$td/test$N.rc") &
+    (psleep $T; echo "$da"; psleep $T) |($TRACE $SOCAT $opts "$arg1" "$arg2" >"$tf" 2>"$te"; echo $? >"$td/test$N.rc") &
     export rc1=$!
     #sleep 5 && kill $rc1 2>/dev/null &
 #    rc2=$!
     wait $rc1
 #    kill $rc2 2>/dev/null
     if [ "$(cat "$td/test$N.rc")" != 0 ]; then
-	$PRINTF "$FAILED: $SOCAT:\n"
-	echo "$SOCAT $opts $arg1 $arg2"
+	$PRINTF "$FAILED: $TRACE $SOCAT:\n"
+	echo "$TRACE $SOCAT $opts $arg1 $arg2"
 	cat "$te"
 	numFAIL=$((numFAIL+1))
+	listFAIL="$listFAIL $N"
     elif echo "$da" |diff - "$tf" >"$tdiff" 2>&1; then
 	$PRINTF "$OK\n"
 	if [ -n "$debug" ]; then cat $te; fi
 	numOK=$((numOK+1))
     else
 	$PRINTF "$FAILED:\n"
-	echo "$SOCAT $opts $arg1 $arg2"
+	echo "$TRACE $SOCAT $opts $arg1 $arg2"
 	cat "$te"
 	echo diff:
 	cat "$tdiff"
 	numFAIL=$((numFAIL+1))
+	listFAIL="$listFAIL $N"
     fi
     fi # NUMCOND
 }
@@ -1552,12 +1648,13 @@ testod () {
     echo "$dain" |$OD_C >"$tr"
 #    local daout="$(echo "$dain" |$OD_C)"
     $PRINTF "test $F_n %s... " $num "$title"
-    (psleep $T; echo "$dain"; psleep $T) |$SOCAT $opts "$arg1" "$arg2" >"$tf" 2>"$te"
+    (psleep $T; echo "$dain"; psleep $T) |$TRACE $SOCAT $opts "$arg1" "$arg2" >"$tf" 2>"$te"
     if [ "$?" != 0 ]; then
-	$PRINTF "$FAILED: $SOCAT:\n"
-	echo "$SOCAT $opts $arg1 $arg2"
+	$PRINTF "$FAILED: $TRACE $SOCAT:\n"
+	echo "$TRACE $SOCAT $opts $arg1 $arg2"
 	cat "$te"
 	numFAIL=$((numFAIL+1))
+	listFAIL="$listFAIL $num"
 #    elif echo "$daout" |diff - "$tf" >"$tdiff" 2>&1; then
     elif diff "$tr" "$tf" >"$tdiff" 2>&1; then
 	$PRINTF "$OK\n"
@@ -1565,10 +1662,11 @@ testod () {
 	numOK=$((numOK+1))
     else
 	$PRINTF "$FAILED: diff:\n"
-	echo "$SOCAT $opts $arg1 $arg2"
+	echo "$TRACE $SOCAT $opts $arg1 $arg2"
 	cat "$te"
 	cat "$tdiff"
 	numFAIL=$((numFAIL+1))
+	listFAIL="$listFAIL $num"
     fi
     fi # NUMCOND
 }
@@ -1579,7 +1677,7 @@ testaddrs () {
     local a A;
     for a in $@; do
 	A=$(echo "$a" |tr 'a-z-' 'A-Z_')
-	if $SOCAT -V |grep "#define WITH_$A 1\$" >/dev/null; then
+	if $TRACE $SOCAT -V |grep "#define WITH_$A 1\$" >/dev/null; then
 	    shift
 	    continue
 	fi
@@ -1595,38 +1693,13 @@ testoptions () {
     local a A;
     for a in $@; do
 	A=$(echo "$a" |tr 'a-z' 'A-Z')
-	if $SOCAT -??? |grep "[^a-z0-9-]$a[^a-z0-9-]" >/dev/null; then
+	if $TRACE $SOCAT -??? |grep "[^a-z0-9-]$a[^a-z0-9-]" >/dev/null; then
 	    shift
 	    continue
 	fi
 	echo "$a"
 	return 1
     done
-    return 0
-}
-
-# check if a process with given pid exists; print its ps line
-# if yes: prints line to stdout, returns 0
-# if not: prints ev.message to stderr, returns 1
-ifprocess () {
-    local l
-    case "$UNAME" in
-    AIX)     l="$(ps -fade |grep "^........ $(printf %6u $1)")" ;;
-    FreeBSD) l="$(ps -faje |grep "^........ $(printf %5u $1)")" ;;
-    HP-UX)   l="$(ps -fade |grep "^........ $(printf %5u $1)")" ;;
-    Linux)   l="$(ps -fade |grep "^........ $(printf %5u $1)")" ;;
-#    NetBSD)  l="$(ps -aj   |grep "^........ $(printf %4u $1)")" ;;
-    NetBSD)  l="$(ps -aj   |grep "^[^ ][^ ]*[ ][ ]*$(printf %5u $1) ")" ;;
-    OpenBSD) l="$(ps -kaj  |grep "^........ $(printf %5u $1)")" ;;
-    SunOS)   l="$(ps -fade |grep "^........ $(printf %5u $1)")" ;;
-    DragonFly)l="$(ps -faje |grep "^[^ ][^ ]*[ ][ ]*$(printf %5u $1)")" ;;
-    CYGWIN*)  l="$(ps -pafe |grep "^[^ ]*[ ][ ]*$1[ ]")" ;;
-    *)       l="$(ps -fade |grep "^[^ ][^ ]*[ ][ ]*$(printf %5u $1) ")" ;;
-    esac
-    if [ -z "$l" ]; then
-	return 1;
-    fi
-    echo "$l"
     return 0
 }
 
@@ -1674,7 +1747,7 @@ isdefunct () {
 # check if UNIX socket protocol is available on host
 runsunix () {
     return 0;
-    $SOCAT /dev/null UNIX-LISTEN:"$td/unix.socket" 2>"$td/unix.stderr" &
+    $TRACE $SOCAT /dev/null UNIX-LISTEN:"$td/unix.socket" 2>"$td/unix.stderr" &
     pid=$!
     usleep $MICROS
     kill "$pid" 2>/dev/null
@@ -1690,13 +1763,14 @@ runsip4 () {
     AIX)   l=$($IFCONFIG lo0 |fgrep 'inet 127.0.0.1 ') ;;
     FreeBSD) l=$($IFCONFIG lo0 |fgrep 'inet 127.0.0.1 ') ;;
     HP-UX) l=$($IFCONFIG lo0 |fgrep 'inet 127.0.0.1 ') ;;
-    Linux) l=$($IFCONFIG |fgrep 'inet addr:127.0.0.1 ') ;;
+    Linux) l=$($IFCONFIG |egrep 'inet (addr:)?127\.0\.0\.1 ') ;;
     NetBSD)l=$($IFCONFIG -a |fgrep 'inet 127.0.0.1 ');;
     OpenBSD)l=$($IFCONFIG -a |fgrep 'inet 127.0.0.1 ');;
     OSF1)  l=$($IFCONFIG -a |grep ' inet ') ;;
     SunOS) l=$($IFCONFIG -a |grep 'inet ') ;;
     Darwin)l=$($IFCONFIG lo0 |fgrep 'inet 127.0.0.1 ') ;;
     DragonFly)l=$($IFCONFIG -a |fgrep 'inet 127.0.0.1 ');;
+    CYGWIN*) l=$(ipconfig |grep IPv4);;
     *)     l=$($IFCONFIG -a |grep ' ::1[^:0-9A-Fa-f]') ;;
     esac
     [ -z "$l" ] && return 1    
@@ -1716,14 +1790,15 @@ runsip6 () {
     [ -n "$HAVENOT_IP6" ] && return $HAVENOT_IP6
     local l
     case "$UNAME" in
-    AIX)   l=$(/usr/sbin/ifconfig lo0 |grep 'inet6 ::1/0') ;;
-    HP-UX) l=$(/usr/sbin/ifconfig lo0 |grep ' inet6 ') ;;
-    Linux) l=$(/sbin/ifconfig |grep 'inet6 addr: ::1/') ;;
-    NetBSD)l=$(/sbin/ifconfig -a |grep 'inet6 ::1 ');;
-    OSF1)  l=$(/sbin/ifconfig -a |grep ' inet6 ') ;;
-    SunOS) l=$(/sbin/ifconfig -a |grep 'inet6 ') ;;
-    Darwin)l=$(/sbin/ifconfig lo0 |grep 'inet6 ::1 ') ;;
-    *)     l=$(/sbin/ifconfig -a |grep ' ::1[^:0-9A-Fa-f]') ;;
+    AIX)   l=$($IFCONFIG lo0 |grep 'inet6 ::1/0') ;;
+    HP-UX) l=$($IFCONFIG lo0 |grep ' inet6 ') ;;
+    Linux) l=$($IFCONFIG |egrep 'inet6 (addr: )?::1/?') ;;
+    NetBSD)l=$($IFCONFIG -a |grep 'inet6 ::1 ');;
+    OSF1)  l=$($IFCONFIG -a |grep ' inet6 ') ;;
+    SunOS) l=$($IFCONFIG -a |grep 'inet6 ') ;;
+    Darwin)l=$($IFCONFIG lo0 |grep 'inet6 ::1 ') ;;
+    CYGWIN*) l=$(ipconfig |grep IPv6);;
+    *)     l=$($IFCONFIG -a |grep ' ::1[^:0-9A-Fa-f]') ;;
     esac
     [ -z "$l" ] && return 1    
     # existence of interface might not suffice, check for routeability:
@@ -1740,7 +1815,7 @@ runsip6 () {
 runstcp4 () {
     return 0;
 #    PORT="$1"
-    $SOCAT /dev/null TCP4-LISTEN:$PORT 2>"$td/tcp4.stderr" &
+    $TRACE $SOCAT $opts /dev/null TCP4-LISTEN:$PORT 2>"$td/tcp4.stderr" &
     pid=$!
     usleep $MICROS
     kill "$pid" 2>/dev/null
@@ -1753,7 +1828,7 @@ runstcp4 () {
 runstcp6 () {
     return 0;
 #    PORT="$1"
-    $SOCAT /dev/null TCP6-LISTEN:$PORT 2>"$td/tcp6.stderr" &
+    $TRACE $SOCAT $opts /dev/null TCP6-LISTEN:$PORT 2>"$td/tcp6.stderr" &
     pid=$!
     kill "$pid" 2>/dev/null
     wait
@@ -1765,7 +1840,7 @@ runstcp6 () {
 runsudp4 () {
     return 0;
 #    PORT="$1"
-    $SOCAT /dev/null UDP4-LISTEN:$PORT 2>"$td/udp4.stderr" &
+    $TRACE $SOCAT $opts /dev/null UDP4-LISTEN:$PORT 2>"$td/udp4.stderr" &
     pid=$!
     usleep $MICROS
     kill "$pid" 2>/dev/null
@@ -1778,7 +1853,7 @@ runsudp4 () {
 runsudp6 () {
     return 0;
 #    PORT="$1"
-    $SOCAT /dev/null UDP6-LISTEN:$PORT 2>"$td/udp6.stderr" &
+    $TRACE $SOCAT $opts /dev/null UDP6-LISTEN:$PORT 2>"$td/udp6.stderr" &
     pid=$!
     usleep $MICROS
     kill "$pid" 2>/dev/null
@@ -1790,7 +1865,7 @@ runsudp6 () {
 # check if SCTP on IPv4 is available on host
 runssctp4 () {
 #    PORT="$1"
-    $SOCAT /dev/null SCTP4-LISTEN:$PORT 2>"$td/sctp4.stderr" &
+    $TRACE $SOCAT $opts /dev/null SCTP4-LISTEN:$PORT 2>"$td/sctp4.stderr" &
     pid=$!
     usleep $MICROS
     kill "$pid" 2>/dev/null
@@ -1802,7 +1877,7 @@ runssctp4 () {
 # check if SCTP on IPv6 is available on host
 runssctp6 () {
     #PORT="$1"
-    $SOCAT /dev/null SCTP6-LISTEN:$PORT 2>"$td/sctp6.stderr" &
+    $TRACE $SOCAT $opts /dev/null SCTP6-LISTEN:$PORT 2>"$td/sctp6.stderr" &
     pid=$!
     usleep $MICROS
     kill "$pid" 2>/dev/null
@@ -1899,7 +1974,7 @@ checktcp4port () {
     local port="$1"
     local l
     case "$UNAME" in
-    Linux)   l=$(netstat -n -t |grep '^tcp .* .*[0-9*]:'$port' .* LISTEN') ;;
+    Linux)   l=$(netstat -a -n -t |grep '^tcp .* .*[0-9*]:'$port' .* LISTEN') ;;
     FreeBSD) l=$(netstat -an |grep '^tcp4.* .*[0-9*]\.'$port' .* \*\.\* .* LISTEN') ;;
     NetBSD)  l=$(netstat -an |grep '^tcp .* .*[0-9*]\.'$port' [ ]* \*\.\* [ ]* LISTEN.*') ;;
     Darwin) case "$(uname -r)" in
@@ -1924,11 +1999,12 @@ waittcp4port () {
     local logic="$2"	# 0..wait until free; 1..wait until listening
     local timeout="$3"
     local l
+    local vx=+; case $- in *vx*) set +vx; vx=-; esac	# no tracing here
     [ "$logic" ] || logic=1
     [ "$timeout" ] || timeout=5
     while [ $timeout -gt 0 ]; do
 	case "$UNAME" in
-	Linux)   l=$(netstat -n -t -l |grep '^tcp .* .*[0-9*]:'$port' .* LISTEN') ;;
+	Linux)   l=$(netstat -a -n -t -l |grep '^tcp .* .*[0-9*]:'$port' .* LISTEN') ;;
 	FreeBSD) l=$(netstat -an |grep '^tcp4.* .*[0-9*]\.'$port' .* \*\.\* .* LISTEN') ;;
 	NetBSD)  l=$(netstat -an |grep '^tcp .* .*[0-9*]\.'$port' [ ]* \*\.\* [ ]* LISTEN.*') ;;
 	Darwin) case "$(uname -r)" in
@@ -1943,13 +2019,17 @@ waittcp4port () {
 	DragonFly)  l=$(netstat -ant |grep '^tcp4 .* .*[0-9*]\.'$port' [ ]* \*\.\* [ ]* LISTEN.*') ;;
  	*)       l=$(netstat -an |grep -i 'tcp .*[0-9*][:.]'$port' .* listen') ;;
 	esac
-	[ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
-	  \( \( $logic -eq 0 \) -a -z "$l" \) ] && return 0
+	if [ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
+	    \( \( $logic -eq 0 \) -a -z "$l" \) ]; then
+	    set ${vx}vx
+	    return 0
+	fi
 	sleep 1
 	timeout=$((timeout-1))
     done
 
     $ECHO "!port $port timed out! \c" >&2
+    set ${vx}vx
     return 1
 }
 
@@ -1959,11 +2039,12 @@ waitudp4port () {
     local logic="$2"	# 0..wait until free; 1..wait until listening
     local timeout="$3"
     local l
-    [ "$logic" ] || logic=1
+    local vx=+; case $- in *vx*) set +vx; vx=-; esac	# no tracing here
+     [ "$logic" ] || logic=1
     [ "$timeout" ] || timeout=5
     while [ $timeout -gt 0 ]; do
 	case "$UNAME" in
-	Linux)   l=$(netstat -n -u -l |grep '^udp .* .*[0-9*]:'$port' [ ]*0\.0\.0\.0:\*') ;;
+	Linux)   l=$(netstat -a -n -u -l |grep '^udp .* .*[0-9*]:'$port' [ ]*0\.0\.0\.0:\*') ;;
 	FreeBSD) l=$(netstat -an |egrep '^udp46? .*[0-9*]\.'$port' .* \*\.\*') ;;
 	NetBSD)  l=$(netstat -an |grep '^udp .*[0-9*]\.'$port' [ ]* \*\.\*') ;;
 	OpenBSD) l=$(netstat -an |grep '^udp .*[0-9*]\.'$port' [ ]* \*\.\*') ;;
@@ -1978,13 +2059,17 @@ waitudp4port () {
 	DragonFly) l=$(netstat -an |grep '^udp4 .* .*[0-9*]\.'$port' [ ]* \*\.\* [ ]*') ;;
  	*)       l=$(netstat -an |grep -i 'udp .*[0-9*][:.]'$port' ') ;;
 	esac
-	[ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
-	  \( \( $logic -eq 0 \) -a -z "$l" \) ] && return 0
+	if [ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
+	    \( \( $logic -eq 0 \) -a -z "$l" \) ]; then
+	    set ${vx}vx
+	    return 0
+	fi
 	sleep 1
 	timeout=$((timeout-1))
     done
 
     $ECHO "!port $port timed out! \c" >&2
+    set ${vx}vx
     return 1
 }
 
@@ -1994,7 +2079,8 @@ waitsctp4port () {
     local logic="$2"	# 0..wait until free; 1..wait until listening
     local timeout="$3"
     local l
-    [ "$logic" ] || logic=1
+    local vx=+; case $- in *vx*) set +vx; vx=-; esac	# no tracing here
+     [ "$logic" ] || logic=1
     [ "$timeout" ] || timeout=5
     while [ $timeout -gt 0 ]; do
 	case "$UNAME" in
@@ -2012,13 +2098,17 @@ waitsctp4port () {
 #	CYGWIN*) l=$(netstat -an -p TCP |grep '^  TCP    [0-9.]*:'$port' .* LISTENING') ;;
  	*)       l=$(netstat -an |grep -i 'sctp .*[0-9*][:.]'$port' .* listen') ;;
 	esac
-	[ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
-	  \( \( $logic -eq 0 \) -a -z "$l" \) ] && return 0
+	if [ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
+	    \( \( $logic -eq 0 \) -a -z "$l" \) ]; then
+	    set ${vx}vx
+	    return 0
+	fi
 	sleep 1
 	timeout=$((timeout-1))
     done
 
     $ECHO "!port $port timed out! \c" >&2
+    set ${vx}vx
     return 1
 }
 
@@ -2028,6 +2118,7 @@ waittcp6port () {
     local logic="$2"	# 0..wait until free; 1..wait until listening
     local timeout="$3"
     local l
+    local vx=+; case $- in *vx*) set +vx; vx=-; esac	# no tracing here
     [ "$logic" ] || logic=1
     [ "$timeout" ] || timeout=5
     while [ $timeout -gt 0 ]; do
@@ -2043,13 +2134,18 @@ waittcp6port () {
 	DragonFly)  l=$(netstat -ant |grep '^tcp6 .* .*[0-9*]\.'$port' [ ]* \*\.\* [ ]* LISTEN.*') ;;
  	*)       l=$(netstat -an |grep -i 'tcp6 .*:'$port' .* listen') ;;
 	esac
-	[ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
-	  \( \( $logic -eq 0 \) -a -z "$l" \) ] && return 0
+	if [ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
+	    \( \( $logic -eq 0 \) -a -z "$l" \) ]; then
+	    set ${vx}vx
+	    return 0
+	fi
 	sleep 1
 	timeout=$((timeout-1))
     done
 
     $ECHO "!port $port timed out! \c" >&2
+    #echo set ${vx}vx >&2
+    set ${vx}vx
     return 1
 }
 
@@ -2059,6 +2155,7 @@ waitudp6port () {
     local logic="$2"	# 0..wait until free; 1..wait until listening
     local timeout="$3"
     local l
+    local vx=+; case $- in *vx*) set +vx; vx=-; esac	# no tracing here
     [ "$logic" ] || logic=1
     [ "$timeout" ] || timeout=5
     while [ $timeout -gt 0 ]; do
@@ -2075,13 +2172,17 @@ waitudp6port () {
 	DragonFly) l=$(netstat -ant |grep '^udp6 .* .*[0-9*]\.'$port' [ ]* \*\.\* [ ]*') ;;
  	*)       l=$(netstat -an |grep -i 'udp .*[0-9*][:.]'$port' ') ;;
 	esac
-	[ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
-	  \( \( $logic -eq 0 \) -a -z "$l" \) ] && return 0
+	if [ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
+	    \( \( $logic -eq 0 \) -a -z "$l" \) ]; then
+	    set ${vx}vx
+	    return 0
+	fi
 	sleep 1
 	timeout=$((timeout-1))
     done
 
     $ECHO "!port $port timed out! \c" >&2
+    set ${vx}vx
     return 1
 }
 
@@ -2092,6 +2193,7 @@ waitsctp6port () {
     local logic="$2"	# 0..wait until free; 1..wait until listening
     local timeout="$3"
     local l
+    local vx=+; case $- in *vx*) set +vx; vx=-; esac	# no tracing here
     [ "$logic" ] || logic=1
     [ "$timeout" ] || timeout=5
     while [ $timeout -gt 0 ]; do
@@ -2105,13 +2207,17 @@ waitsctp6port () {
 #	#OSF1)    l=$(/usr/sbin/netstat -an |grep '^tcp6       0      0  .*[0-9*]\.'$port' [ ]*\*\.\* [ ]*LISTEN') /*?*/;;
  	*)       l=$(netstat -an |grep -i 'stcp6 .*:'$port' .* listen') ;;
 	esac
-	[ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
-	  \( \( $logic -eq 0 \) -a -z "$l" \) ] && return 0
+	if [ \( \( $logic -ne 0 \) -a -n "$l" \) -o \
+	    \( \( $logic -eq 0 \) -a -z "$l" \) ]; then
+	    set ${vx}vx
+	    return 0
+	fi
 	sleep 1
 	timeout=$((timeout-1))
     done
 
     $ECHO "!port $port timed out! \c" >&2
+    set ${vx}vx
     return 1
 }
 
@@ -2128,12 +2234,14 @@ waitfile () {
     local logic="$2"	# 0..wait until gone; 1..wait until exists (default);
 			# 2..wait until not empty
     local timeout="$3"
+    local vx=+; case $- in *vx*) set +vx; vx=-; esac	# no tracing here
     [ "$logic" ] || logic=1
     [ "$logic" -eq 2 ] && crit=-s
     [ "$timeout" ] || timeout=5
     while [ $timeout -gt 0 ]; do
 	if [ \( \( $logic -ne 0 \) -a $crit "$file" \) -o \
 	    \( \( $logic -eq 0 \) -a ! $crit "$file" \) ]; then
+	    set ${vx}vx
 	    return 0
 	fi
 	sleep 1
@@ -2141,6 +2249,7 @@ waitfile () {
     done
 
     echo "file $file timed out" >&2
+    set ${vx}vx
     return 1
 }
 
@@ -2149,7 +2258,7 @@ gentestcert () {
     local name="$1"
     if [ -s $name.key -a -s $name.crt -a -s $name.pem ]; then return; fi
     openssl genrsa $OPENSSL_RAND -out $name.key 768 >/dev/null 2>&1
-    openssl req -new -config testcert.conf -key $name.key -x509 -out $name.crt -days 3653 >/dev/null 2>&1
+    openssl req -new -config $TESTCERT_CONF -key $name.key -x509 -out $name.crt -days 3653 >/dev/null 2>&1
     cat $name.key $name.crt >$name.pem
 }
 
@@ -2159,14 +2268,25 @@ gentestdsacert () {
     if [ -s $name.key -a -s $name.crt -a -s $name.pem ]; then return; fi
     openssl dsaparam -out $name-dsa.pem 512 >/dev/null 2>&1
     openssl dhparam -dsaparam -out $name-dh.pem 512 >/dev/null 2>&1
-    openssl req -newkey dsa:$name-dsa.pem -keyout $name.key -nodes -x509 -config testcert.conf -out $name.crt -days 3653 >/dev/null 2>&1
+    openssl req -newkey dsa:$name-dsa.pem -keyout $name.key -nodes -x509 -config $TESTCERT_CONF -out $name.crt -days 3653 >/dev/null 2>&1
     cat $name-dsa.pem $name-dh.pem $name.key $name.crt >$name.pem
+}
+
+gentestcert6 () {
+    local name="$1"
+    if [ -s $name.key -a -s $name.crt -a -s $name.pem ]; then return; fi
+    cat $TESTCERT_CONF |
+    { echo "# automatically generated by $0"; cat; } |
+    sed 's/\(commonName\s*=\s*\).*/\1[::1]/' >$TESTCERT6_CONF
+    openssl genrsa $OPENSSL_RAND -out $name.key 768 >/dev/null 2>&1
+    openssl req -new -config $TESTCERT6_CONF -key $name.key -x509 -out $name.crt -days 3653 >/dev/null 2>&1
+    cat $name.key $name.crt >$name.pem
 }
 
 
 NAME=UNISTDIO
 case "$TESTS " in
-*%functions%*|*%stdio%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%stdio%*|*%$NAME%*)
 TEST="$NAME: unidirectional throughput from stdin to stdout"
 testecho "$N" "$TEST" "stdin" "stdout" "$opts -u"
 esac
@@ -2175,7 +2295,7 @@ N=$((N+1))
 
 NAME=UNPIPESTDIO
 case "$TESTS" in
-*%functions%*|*%stdio%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%stdio%*|*%$NAME%*)
 TEST="$NAME: stdio with simple echo via internal pipe"
 testecho "$N" "$TEST" "stdio" "pipe" "$opts"
 esac
@@ -2184,7 +2304,7 @@ N=$((N+1))
 
 NAME=UNPIPESHORT
 case "$TESTS" in
-*%functions%*|*%stdio%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%stdio%*|*%$NAME%*)
 TEST="$NAME: short form of stdio ('-') with simple echo via internal pipe"
 testecho "$N" "$TEST" "-" "pipe" "$opts"
 esac
@@ -2193,7 +2313,7 @@ N=$((N+1))
 
 NAME=DUALSTDIO
 case "$TESTS" in
-*%functions%*|*%stdio%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%stdio%*|*%$NAME%*)
 TEST="$NAME: splitted form of stdio ('stdin!!stdout') with simple echo via internal pipe"
 testecho "$N" "$TEST" "stdin!!stdout" "pipe" "$opts"
 esac
@@ -2202,7 +2322,7 @@ N=$((N+1))
 
 NAME=DUALSHORTSTDIO
 case "$TESTS" in
-*%functions%*|*%stdio%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%stdio%*|*%$NAME%*)
 TEST="$NAME: short splitted form of stdio ('-!!-') with simple echo via internal pipe"
 testecho "$N" "$TEST" "-!!-" "pipe" "$opts"
 esac
@@ -2211,7 +2331,7 @@ N=$((N+1))
 
 NAME=DUALFDS
 case "$TESTS" in
-*%functions%*|*%fd%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%fd%*|*%$NAME%*)
 TEST="$NAME: file descriptors with simple echo via internal pipe"
 testecho "$N" "$TEST" "0!!1" "pipe" "$opts"
 esac
@@ -2220,7 +2340,7 @@ N=$((N+1))
 
 NAME=NAMEDPIPE
 case "$TESTS" in
-*%functions%*|*%pipe%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pipe%*|*%$NAME%*)
 TEST="$NAME: simple echo via named pipe"
 # with MacOS, this test hangs if nonblock is not used. Is an OS bug.
 tp="$td/pipe$N"
@@ -2232,7 +2352,7 @@ N=$((N+1))
 
 NAME=DUALPIPE
 case "$TESTS" in
-*%functions%*|*%pipe%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pipe%*|*%$NAME%*)
 TEST="$NAME: simple echo via named pipe, specified twice"
 tp="$td/pipe$N"
 testecho "$N" "$TEST" "" "pipe:$tp,nonblock!!pipe:$tp" "$opts"
@@ -2242,7 +2362,7 @@ N=$((N+1))
 
 NAME=FILE
 case "$TESTS" in
-*%functions%*|*%engine%*|*%file%*|*%ignoreeof%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%file%*|*%ignoreeof%*|*%$NAME%*)
 TEST="$NAME: simple echo via file"
 tf="$td/file$N"
 testecho "$N" "$TEST" "" "$tf,ignoreeof!!$tf" "$opts"
@@ -2252,7 +2372,7 @@ N=$((N+1))
 
 NAME=EXECSOCKET
 case "$TESTS" in
-*%functions%*|*%exec%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%exec%*|*%$NAME%*)
 TEST="$NAME: simple echo via exec of cat with socketpair"
 testecho "$N" "$TEST" "" "exec:$CAT" "$opts"
 esac
@@ -2261,7 +2381,7 @@ N=$((N+1))
 
 NAME=SYSTEMSOCKET
 case "$TESTS" in
-*%functions%*|*%system%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%system%*|*%$NAME%*)
 TEST="$NAME: simple echo via system() of cat with socketpair"
 testecho "$N" "$TEST" "" "system:$CAT" "$opts" "$val_t"
 esac
@@ -2270,7 +2390,7 @@ N=$((N+1))
 
 NAME=EXECPIPES
 case "$TESTS" in
-*%functions%*|*%pipe%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pipe%*|*%$NAME%*)
 TEST="$NAME: simple echo via exec of cat with pipes"
 testecho "$N" "$TEST" "" "exec:$CAT,pipes" "$opts"
 esac
@@ -2279,7 +2399,7 @@ N=$((N+1))
 
 NAME=SYSTEMPIPES
 case "$TESTS" in
-*%functions%*|*%pipes%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pipes%*|*%$NAME%*)
 TEST="$NAME: simple echo via system() of cat with pipes"
 testecho "$N" "$TEST" "" "system:$CAT,pipes" "$opts"
 esac
@@ -2288,7 +2408,7 @@ N=$((N+1))
 
 NAME=EXECPTY
 case "$TESTS" in
-*%functions%*|*%exec%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%exec%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: simple echo via exec of cat with pseudo terminal"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs pty >/dev/null; then
@@ -2303,7 +2423,7 @@ N=$((N+1))
 
 NAME=SYSTEMPTY
 case "$TESTS" in
-*%functions%*|*%system%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%system%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: simple echo via system() of cat with pseudo terminal"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs pty >/dev/null; then
@@ -2318,7 +2438,7 @@ N=$((N+1))
 
 NAME=SYSTEMPIPESFDS
 case "$TESTS" in
-*%functions%*|*%system%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%system%*|*%$NAME%*)
 TEST="$NAME: simple echo via system() of cat with pipes, non stdio"
 testecho "$N" "$TEST" "" "system:$CAT>&9 <&8,pipes,fdin=8,fdout=9" "$opts"
 esac
@@ -2327,7 +2447,7 @@ N=$((N+1))
 
 NAME=DUALSYSTEMFDS
 case "$TESTS" in
-*%functions%*|*%system%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%system%*|*%$NAME%*)
 TEST="$NAME: echo via dual system() of cat"
 testecho "$N" "$TEST" "system:$CAT>&6,fdout=6!!system:$CAT<&7,fdin=7" "" "$opts" "$val_t"
 esac
@@ -2340,7 +2460,7 @@ NAME=EXECSOCKETFLUSH
 # idea: have socat exec'ing od; send data and EOF, and check if the od'ed data
 # arrives.
 case "$TESTS" in
-*%functions%*|*%exec%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%exec%*|*%$NAME%*)
 TEST="$NAME: call to od via exec with socketpair"
 testod "$N" "$TEST" "" "exec:$OD_C" "$opts"
 esac
@@ -2349,7 +2469,7 @@ N=$((N+1))
 
 NAME=SYSTEMSOCKETFLUSH
 case "$TESTS" in
-*%functions%*|*%system%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%system%*|*%$NAME%*)
 TEST="$NAME: call to od via system() with socketpair"
 testod "$N" "$TEST" "" "system:$OD_C" "$opts" $val_t
 esac
@@ -2358,7 +2478,7 @@ N=$((N+1))
 
 NAME=EXECPIPESFLUSH
 case "$TESTS" in
-*%functions%*|*%exec%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%exec%*|*%$NAME%*)
 TEST="$NAME: call to od via exec with pipes"
 testod "$N" "$TEST" "" "exec:$OD_C,pipes" "$opts"
 esac
@@ -2367,7 +2487,7 @@ N=$((N+1))
 
 NAME=SYSTEMPIPESFLUSH
 case "$TESTS" in
-*%functions%*|*%system%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%system%*|*%$NAME%*)
 TEST="$NAME: call to od via system() with pipes"
 testod "$N" "$TEST" "" "system:$OD_C,pipes" "$opts" "$val_t"
 esac
@@ -2377,7 +2497,7 @@ N=$((N+1))
 ## LATER:
 #NAME=EXECPTYFLUSH
 #case "$TESTS" in
-#*%functions%*|*%exec%*|*%pty%*|*%$NAME%*)
+#*%$N%*|*%functions%*|*%exec%*|*%pty%*|*%$NAME%*)
 #TEST="$NAME: call to od via exec with pseudo terminal"
 #if ! testaddrs pty >/dev/null; then
 #    $PRINTF "test $F_n $TEST... ${YELLOW}PTY not available${NORMAL}\n" $N
@@ -2392,7 +2512,7 @@ N=$((N+1))
 ## LATER:
 #NAME=SYSTEMPTYFLUSH
 #case "$TESTS" in
-#*%functions%*|*%system%*|*%pty%*|*%$NAME%*)
+#*%$N%*|*%functions%*|*%system%*|*%pty%*|*%$NAME%*)
 #TEST="$NAME: call to od via system() with pseudo terminal"
 #if ! testaddrs pty >/dev/null; then
 #    $PRINTF "test $F_n $TEST... ${YELLOW}PTY not available${NORMAL}\n" $N
@@ -2406,7 +2526,7 @@ N=$((N+1))
 
 NAME=SYSTEMPIPESFDSFLUSH
 case "$TESTS" in
-*%functions%*|*%system%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%system%*|*%$NAME%*)
 TEST="$NAME: call to od via system() with pipes, non stdio"
 testod "$N" "$TEST" "" "system:$OD_C>&9 <&8,pipes,fdin=8,fdout=9" "$opts" "$val_t"
 esac
@@ -2415,7 +2535,7 @@ N=$((N+1))
 
 NAME=DUALSYSTEMFDSFLUSH
 case "$TESTS" in
-*%functions%*|*%system%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%system%*|*%$NAME%*)
 TEST="$NAME: call to od via dual system()"
 testod "$N" "$TEST" "system:$OD_C>&6,fdout=6!!system:$CAT<&7,fdin=7" "pipe" "$opts" "$val_t"
 esac
@@ -2430,7 +2550,7 @@ esac
 
 NAME=RAWIP4SELF
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%rawip%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%rawip%*|*%root%*|*%$NAME%*)
 TEST="$NAME: simple echo via self receiving raw IPv4 protocol"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4) || ! runsip4 >/dev/null; then
@@ -2450,7 +2570,7 @@ N=$((N+1))
 
 NAME=RAWIPX4SELF
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%rawip%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%rawip%*|*%root%*|*%$NAME%*)
 TEST="$NAME: simple echo via self receiving raw IP protocol, v4 by target"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4) || ! runsip4 >/dev/null; then
@@ -2470,7 +2590,7 @@ N=$((N+1))
 
 NAME=RAWIP6SELF
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%rawip%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%rawip%*|*%root%*|*%$NAME%*)
 TEST="$NAME: simple echo via self receiving raw IPv6 protocol"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip6) || ! runsip6 >/dev/null; then
@@ -2490,7 +2610,7 @@ N=$((N+1))
 
 NAME=RAWIPX6SELF
 case "$TESTS" in
-*%functions%*|*%ip%*|*%ip6%*|*%rawip%*|*%rawip6%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip%*|*%ip6%*|*%rawip%*|*%rawip6%*|*%root%*|*%$NAME%*)
 TEST="$NAME: simple echo via self receiving raw IP protocol, v6 by target"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip6) || ! runsip6 >/dev/null; then
@@ -2511,7 +2631,7 @@ N=$((N+1))
 
 NAME=TCPSELF
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: echo via self connection of TCP IPv4 socket"
 if ! eval $NUMCOND; then :;
 elif [ "$UNAME" != Linux ]; then
@@ -2529,7 +2649,7 @@ N=$((N+1))
 NAME=UDPSELF
 if ! eval $NUMCOND; then :; else
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: echo via self connection of UDP IPv4 socket"
 if [ "$UNAME" != Linux ]; then
     $PRINTF "test $F_n $TEST... ${YELLOW}only on Linux$NORMAL\n" $N
@@ -2538,14 +2658,14 @@ else
     testecho "$N" "$TEST" "" "udp:$SECONDADDR:$PORT,sp=$PORT,bind=$SECONDADDR" "$opts"
 fi
 esac
-    fi # NUMCOND
+fi # NUMCOND
 PORT=$((PORT+1))
 N=$((N+1))
 
 
 NAME=UDP6SELF
 case "$TESTS" in
-*%functions%*|*%udp%*|*%udp6%*|*%ip6%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%udp%*|*%udp6%*|*%ip6%*|*%$NAME%*)
 TEST="$NAME: echo via self connection of UDP IPv6 socket"
 if ! eval $NUMCOND; then :;
 elif [ "$UNAME" != Linux ]; then
@@ -2566,7 +2686,7 @@ N=$((N+1))
 NAME=DUALUDPSELF
 if ! eval $NUMCOND; then :; else
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: echo via two unidirectional UDP IPv4 sockets"
 tf="$td/file$N"
 p1=$PORT
@@ -2586,30 +2706,32 @@ N=$((N+1))
 NAME=UNIXSTREAM
 if ! eval $NUMCOND; then :; else
 case "$TESTS" in
-*%functions%*|*%unix%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%unix%*|*%$NAME%*)
 TEST="$NAME: echo via connection to UNIX domain socket"
 tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 ts="$td/test$N.socket"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts UNIX-LISTEN:$ts PIPE"
-CMD2="$SOCAT $opts -!!- UNIX-CONNECT:$ts"
+CMD1="$TRACE $SOCAT $opts UNIX-LISTEN:$ts PIPE"
+CMD2="$TRACE $SOCAT $opts -!!- UNIX-CONNECT:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 </dev/null >$tf 2>"${te}1" &
 bg=$!	# background process id
 waitfile "$ts"
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "$te"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -2624,7 +2746,7 @@ N=$((N+1))
 NAME=TCP4
 if ! eval $NUMCOND; then :; else
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: echo via connection to TCP V4 socket"
 tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
@@ -2632,24 +2754,26 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP4-LISTEN:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP4:$ts"
+CMD1="$TRACE $SOCAT $opts TCP4-LISTEN:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP4:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1=$!
 waittcp4port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    cat "${te}1"
    echo "$CMD2"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -2663,9 +2787,10 @@ fi # NUMCOND
 N=$((N+1))
 
 
+#et -xv
 NAME=TCP6
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: echo via connection to TCP V6 socket"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip6 >/dev/null || ! runsip6 >/dev/null; then
@@ -2678,23 +2803,25 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="[::1]:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP6-listen:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP6:$ts"
+CMD1="$TRACE $SOCAT $opts TCP6-listen:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP6:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp6port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "$te"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -2705,11 +2832,12 @@ fi
 esac
 PORT=$((PORT+1))
 N=$((N+1))
+#set +vx
 
 
 NAME=TCPX4
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: echo via connection to TCP socket, v4 by target"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
@@ -2725,23 +2853,25 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP-listen:$tsl,pf=ip4,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP:$ts"
+CMD1="$TRACE $SOCAT $opts TCP-listen:$tsl,pf=ip4,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp4port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "$te"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -2756,7 +2886,7 @@ N=$((N+1))
 
 NAME=TCPX6
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: echo via connection to TCP socket, v6 by target"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
@@ -2772,23 +2902,25 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="[::1]:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP-listen:$tsl,pf=ip6,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP:$ts"
+CMD1="$TRACE $SOCAT $opts TCP-listen:$tsl,pf=ip6,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp6port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "$te"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -2800,10 +2932,13 @@ esac
 PORT=$((PORT+1))
 N=$((N+1))
 
+# TCP6-LISTEN may also listen for IPv4 connections. Test if option
+# ipv6-v6only=0 shows this behaviour.
 NAME=IPV6ONLY0
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: option ipv6-v6only=0 listens on IPv4"
+# create a listening TCP6 socket and try to connect to the port using TCP4
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
     $PRINTF "test $F_n $TEST... ${YELLOW}TCP4 not available${NORMAL}\n" $N
@@ -2821,23 +2956,25 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP6-listen:$tsl,ipv6-v6only=0,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP4:$ts"
+CMD1="$TRACE $SOCAT $opts TCP6-LISTEN:$tsl,ipv6-v6only=0,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts STDIN!!STDOUT TCP4:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp6port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -2849,9 +2986,12 @@ esac
 PORT=$((PORT+1))
 N=$((N+1))
 
+#set -vx
+# TCP6-LISTEN may also listen for IPv4 connections. Test if option
+# ipv6-v6only=1 turns off this behaviour.
 NAME=IPV6ONLY1
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: option ipv6-v6only=1 does not listen on IPv4"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
@@ -2870,8 +3010,8 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP6-listen:$tsl,ipv6-v6only=1,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP4:$ts"
+CMD1="$TRACE $SOCAT $opts TCP6-listen:$tsl,ipv6-v6only=1,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP4:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
@@ -2881,23 +3021,27 @@ if [ $? -eq 0 ]; then
    $PRINTF "$FAILED:\n"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED:\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    numOK=$((numOK+1))
 fi
-kill $pid 2>/dev/null
+kill $pid; wait
+wait
 fi
 esac
 PORT=$((PORT+1))
 N=$((N+1))
+#set +vx
 
 NAME=ENV_LISTEN_4
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: env SOCAT_DEFAULT_LISTEN_IP for IPv4 preference on listen"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
@@ -2916,29 +3060,31 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP-listen:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP4:$ts"
+CMD1="$TRACE $SOCAT $opts TCP-listen:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP4:$ts"
 printf "test $F_n $TEST... " $N
 SOCAT_DEFAULT_LISTEN_IP=4 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp4port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
    numOK=$((numOK+1))
 fi
-kill $pid 2>/dev/null
+kill $pid 2>/dev/null; wait
 fi
 esac
 PORT=$((PORT+1))
@@ -2946,7 +3092,7 @@ N=$((N+1))
 
 NAME=ENV_LISTEN_6
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: env SOCAT_DEFAULT_LISTEN_IP for IPv6 preference on listen"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
@@ -2962,29 +3108,31 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="[::1]:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP-listen:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP6:$ts"
+CMD1="$TRACE $SOCAT $opts TCP-listen:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP6:$ts"
 printf "test $F_n $TEST... " $N
 SOCAT_DEFAULT_LISTEN_IP=6 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp6port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
    numOK=$((numOK+1))
 fi
-kill $pid 2>/dev/null
+kill $pid 2>/dev/null; wait
 fi
 esac
 PORT=$((PORT+1))
@@ -2992,7 +3140,7 @@ N=$((N+1))
 
 NAME=LISTEN_OPTION_4
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: option -4 for IPv4 preference on listen"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
@@ -3011,29 +3159,31 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -4 TCP-listen:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP4:$ts"
+CMD1="$TRACE $SOCAT $opts -4 TCP-listen:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP4:$ts"
 printf "test $F_n $TEST... " $N
 SOCAT_DEFAULT_LISTEN_IP=6 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp4port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
    numOK=$((numOK+1))
 fi
-kill $pid 2>/dev/null
+kill $pid 2>/dev/null; wait
 fi
 esac
 PORT=$((PORT+1))
@@ -3041,7 +3191,7 @@ N=$((N+1))
 
 NAME=LISTEN_OPTION_6
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: option -6 for IPv6 preference on listen"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
@@ -3057,29 +3207,31 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="[::1]:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -6 TCP-listen:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP6:$ts"
+CMD1="$TRACE $SOCAT $opts -6 TCP-listen:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP6:$ts"
 printf "test $F_n $TEST... " $N
 SOCAT_DEFAULT_LISTEN_IP=4 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp6port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
    numOK=$((numOK+1))
 fi
-kill $pid 2>/dev/null
+kill $pid 2>/dev/null; wait
 wait
 fi # feats
 esac
@@ -3088,7 +3240,7 @@ N=$((N+1))
 
 NAME=LISTEN_PF_IP4
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: pf=4 overrides option -6 on listen"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
@@ -3107,29 +3259,31 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -6 TCP-listen:$tsl,pf=ip4,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP4:$ts"
+CMD1="$TRACE $SOCAT $opts -6 TCP-listen:$tsl,pf=ip4,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP4:$ts"
 printf "test $F_n $TEST... " $N
 SOCAT_DEFAULT_LISTEN_IP=6 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp4port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
    numOK=$((numOK+1))
 fi
-kill $pid 2>/dev/null
+kill $pid 2>/dev/null; wait
 fi
 esac
 PORT=$((PORT+1))
@@ -3137,7 +3291,7 @@ N=$((N+1))
 
 NAME=LISTEN_PF_IP6
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: pf=6 overrides option -4 on listen"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
@@ -3153,29 +3307,31 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="[::1]:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -4 TCP-listen:$tsl,pf=ip6,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP6:$ts"
+CMD1="$TRACE $SOCAT $opts -4 TCP-listen:$tsl,pf=ip6,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP6:$ts"
 printf "test $F_n $TEST... " $N
 SOCAT_DEFAULT_LISTEN_IP=4 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp6port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
    numOK=$((numOK+1))
 fi
-kill $pid 2>/dev/null
+kill $pid 2>/dev/null; wait
 fi ;; # NUMCOND, feats
 esac
 PORT=$((PORT+1))
@@ -3184,7 +3340,7 @@ N=$((N+1))
 
 NAME=UDP4STREAM
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%ipapp%*|*%udp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%udp%*|*%$NAME%*)
 TEST="$NAME: echo via connection to UDP V4 socket"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
@@ -3193,8 +3349,8 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="$LOCALHOST:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts UDP4-LISTEN:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts - UDP4:$ts"
+CMD1="$TRACE $SOCAT $opts UDP4-LISTEN:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts - UDP4:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1=$!
@@ -3203,11 +3359,12 @@ echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 rc2=$?
 kill $pid1 2>/dev/null; wait
 if [ $rc2 -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    echo "$CMD1 &"
@@ -3216,6 +3373,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    cat "${te}2"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -3229,7 +3387,7 @@ N=$((N+1))
 
 NAME=UDP6STREAM
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%udp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%udp%*|*%$NAME%*)
 TEST="$NAME: echo via connection to UDP V6 socket"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6) || ! runsip6 >/dev/null; then
@@ -3242,8 +3400,8 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="$LOCALHOST6:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts UDP6-LISTEN:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts - UDP6:$ts"
+CMD1="$TRACE $SOCAT $opts UDP6-LISTEN:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts - UDP6:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1=$!
@@ -3252,15 +3410,17 @@ echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 rc2=$?
 kill $pid1 2>/dev/null; wait
 if [ $rc2 -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -3274,7 +3434,7 @@ N=$((N+1))
 
 NAME=GOPENFILE
 case "$TESTS" in
-*%functions%*|*%engine%*|*%gopen%*|*%file%*|*%ignoreeof%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%gopen%*|*%file%*|*%ignoreeof%*|*%$NAME%*)
 TEST="$NAME: file opening with gopen"
 if ! eval $NUMCOND; then :; else
 tf1="$td/test$N.1.stdout"
@@ -3283,18 +3443,20 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
 echo "$da" >$tf1
-CMD="$SOCAT $opts $tf1!!/dev/null /dev/null,ignoreeof!!-"
+CMD="$TRACE $SOCAT $opts $tf1!!/dev/null /dev/null,ignoreeof!!-"
 printf "test $F_n $TEST... " $N
 $CMD >"$tf2" 2>"$te"
 if [ $? -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD"
     cat "$te"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! diff "$tf1" "$tf2" >"$tdiff"; then
     $PRINTF "$FAILED: diff:\n"
     cat "$tdiff"
    numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -3307,7 +3469,7 @@ N=$((N+1))
 
 NAME=GOPENPIPE
 case "$TESTS" in
-*%functions%*|*%gopen%*|*%pipe%*|*%ignoreeof%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%gopen%*|*%pipe%*|*%ignoreeof%*|*%$NAME%*)
 TEST="$NAME: pipe opening with gopen for reading"
 if ! eval $NUMCOND; then :; else
 tp="$td/pipe$N"
@@ -3315,7 +3477,7 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD="$SOCAT $opts $tp!!/dev/null /dev/null,ignoreeof!!$tf"
+CMD="$TRACE $SOCAT $opts $tp!!/dev/null /dev/null,ignoreeof!!$tf"
 printf "test $F_n $TEST... " $N
 #mknod $tp p	# no mknod p on FreeBSD
 mkfifo $tp
@@ -3324,19 +3486,20 @@ $CMD >$tf 2>"$te" &
 bg=$!	# background process id
 usleep $MICROS
 if [ ! -p "$tp" ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD"
     cat "$te"
     numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
 #echo "$da" >"$tp"	# might hang forever
 echo "$da" >"$tp" & export pid=$!; (sleep 1; kill $pid 2>/dev/null) &
 # Solaris needs more time:
 sleep 1
-kill "$bg" 2>/dev/null
+kill "$bg" 2>/dev/null; wait
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
     if [ -s "$te" ]; then
-	$PRINTF "$FAILED: $SOCAT:\n"
+	$PRINTF "$FAILED: $TRACE $SOCAT:\n"
 	echo "$CMD"
 	cat "$te"
     else
@@ -3344,6 +3507,7 @@ if ! echo "$da" |diff - "$tf" >"$tdiff"; then
 	cat "$tdiff"
     fi
     numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -3358,7 +3522,7 @@ N=$((N+1))
 
 NAME=GOPENUNIXSTREAM
 case "$TESTS" in
-*%functions%*|*%gopen%*|*%unix%*|*%listen%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%gopen%*|*%unix%*|*%listen%*|*%$NAME%*)
 TEST="$NAME: GOPEN on UNIX stream socket"
 if ! eval $NUMCOND; then :; else
 ts="$td/test$N.socket"
@@ -3367,9 +3531,9 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da1="test$N $(date) $RANDOM"
 #establish a listening unix socket in background
-SRV="$SOCAT $opts -lpserver UNIX-LISTEN:\"$ts\" PIPE"
+SRV="$TRACE $SOCAT $opts -lpserver UNIX-LISTEN:\"$ts\" PIPE"
 #make a connection
-CMD="$SOCAT $opts - $ts"
+CMD="$TRACE $SOCAT $opts - $ts"
 $PRINTF "test $F_n $TEST... " $N
 eval "$SRV 2>${te}s &"
 pids=$!
@@ -3383,6 +3547,7 @@ if [ $? -ne 0 ]; then
     echo "$CMD"
     cat "${te}1"
     numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 elif ! echo "$da1" |diff - "${tf}1" >"$tdiff"; then
     kill "$pids" 2>/dev/null
     $PRINTF "$FAILED:\n"
@@ -3392,6 +3557,7 @@ elif ! echo "$da1" |diff - "${tf}1" >"$tdiff"; then
     cat "${te}1"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+   listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -3405,7 +3571,7 @@ N=$((N+1))
 
 NAME=GOPENUNIXDGRAM
 case "$TESTS" in
-*%functions%*|*%gopen%*|*%unix%*|*%dgram%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%gopen%*|*%unix%*|*%dgram%*|*%$NAME%*)
 TEST="$NAME: GOPEN on UNIX datagram socket"
 if ! eval $NUMCOND; then :; else
 ts="$td/test$N.socket"
@@ -3414,9 +3580,9 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da1="test$N $(date) $RANDOM"
 #establish a receiving unix socket in background
-SRV="$SOCAT $opts -u -lpserver UNIX-RECV:\"$ts\" file:\"$tf\",create"
+SRV="$TRACE $SOCAT $opts -u -lpserver UNIX-RECV:\"$ts\" file:\"$tf\",create"
 #make a connection
-CMD="$SOCAT $opts -u - $ts"
+CMD="$TRACE $SOCAT $opts -u - $ts"
 $PRINTF "test $F_n $TEST... " $N
 eval "$SRV 2>${te}s &"
 pids=$!
@@ -3430,6 +3596,7 @@ if [ $? -ne 0 ]; then
     echo "$CMD"
     cat "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da1" |diff - "${tf}" >"$tdiff"; then
     $PRINTF "$FAILED:\n"
     echo "$SRV &"
@@ -3438,22 +3605,21 @@ elif ! echo "$da1" |diff - "${tf}" >"$tdiff"; then
     cat "${te}1"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
    numOK=$((numOK+1))
 fi # !(rc -ne 0)
-kill "$pids" 2>/dev/null
-wait
+kill "$pids" 2>/dev/null; wait
 fi ;; # NUMCOND
 esac
 N=$((N+1))
 
 
-#set -vx
 NAME=IGNOREEOF
 case "$TESTS" in
-*%functions%*|*%engine%*|*%ignoreeof%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%ignoreeof%*|*%$NAME%*)
 TEST="$NAME: ignoreeof on file"
 if ! eval $NUMCOND; then :; else
 ti="$td/test$N.file"
@@ -3461,7 +3627,40 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD="$SOCAT $opts -u file:\"$ti\",ignoreeof -"
+CMD="$TRACE $SOCAT $opts -u file:\"$ti\",ignoreeof -"
+printf "test $F_n $TEST... " $N
+touch "$ti"
+$CMD >"$tf" 2>"$te" &
+bg=$!
+usleep 500000
+echo "$da" >>"$ti"
+sleep 1
+kill $bg 2>/dev/null; wait
+if ! echo "$da" |diff - "$tf" >"$tdiff"; then
+    $PRINTF "$FAILED: diff:\n"
+    cat "$tdiff"
+    listFAIL="$listFAIL $N"
+    numFAIL=$((numFAIL+1))
+else
+   $PRINTF "$OK\n"
+   if [ -n "$debug" ]; then cat $te; fi
+   numOK=$((numOK+1))
+fi
+fi ;; # NUMCOND
+esac
+N=$((N+1))
+
+NAME=IGNOREEOF_REV
+case "$TESTS" in
+*%$N%*|*%functions%*|*%engine%*|*%ignoreeof%*|*%$NAME%*)
+TEST="$NAME: ignoreeof on file right-to-left"
+if ! eval $NUMCOND; then :; else
+ti="$td/test$N.file"
+tf="$td/test$N.stdout"
+te="$td/test$N.stderr"
+tdiff="$td/test$N.diff"
+da="test$N $(date) $RANDOM"
+CMD="$SOCAT $opts -U - file:\"$ti\",ignoreeof"
 printf "test $F_n $TEST... " $N
 touch "$ti"
 $CMD >"$tf" 2>"$te" &
@@ -3473,6 +3672,7 @@ kill $bg 2>/dev/null
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
     $PRINTF "$FAILED: diff:\n"
     cat "$tdiff"
+    listFAIL="$listFAIL $N"
     numFAIL=$((numFAIL+1))
 else
    $PRINTF "$OK\n"
@@ -3483,24 +3683,24 @@ wait
 fi ;; # NUMCOND
 esac
 N=$((N+1))
-#set +vx
 
 
 NAME=EXECIGNOREEOF
 case "$TESTS" in
-*%functions%*|*%engine%*|*%ignoreeof%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%ignoreeof%*|*%$NAME%*)
 TEST="$NAME: exec against address with ignoreeof"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
-CMD="$SOCAT $opts -lf /dev/null EXEC:$TRUE /dev/null,ignoreeof"
+CMD="$TRACE $SOCAT $opts -lf /dev/null EXEC:$TRUE /dev/null,ignoreeof"
 printf "test $F_n $TEST... " $N
 $CMD >"$tf" 2>"$te"
 if [ -s "$te" ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -3513,7 +3713,7 @@ N=$((N+1))
 
 NAME=FAKEPTY
 case "$TESTS" in
-*%functions%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: generation of pty for other processes"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs pty >/dev/null; then
@@ -3525,8 +3725,8 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts pty,link=$tt pipe"
-CMD2="$SOCAT $opts - $tt,$PTYOPTS2"
+CMD1="$TRACE $SOCAT $opts pty,link=$tt pipe"
+CMD2="$TRACE $SOCAT $opts - $tt,$PTYOPTS2"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 pid=$!	# background process id
@@ -3537,7 +3737,7 @@ rc2=$!
 #sleep 5 && kill $rc2 2>/dev/null &
 wait $rc2
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     sleep 1
     echo "$CMD2"
@@ -3545,13 +3745,13 @@ if ! echo "$da" |diff - "$tf" >"$tdiff"; then
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
    numOK=$((numOK+1))
 fi
-kill $pid 2>/dev/null
-wait
+kill $pid 2>/dev/null; wait
 fi ;; # NUMCOND, feats
 esac
 N=$((N+1))
@@ -3559,7 +3759,7 @@ N=$((N+1))
 
 NAME=O_TRUNC
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: option o-trunc"
 if ! eval $NUMCOND; then :; else
 ff="$td/test$N.file"
@@ -3567,16 +3767,19 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD="$SOCAT -u $opts - open:$ff,append,o-trunc"
+CMD="$TRACE $SOCAT -u $opts - open:$ff,append,o-trunc"
 printf "test $F_n $TEST... " $N
 rm -f $ff; $ECHO "prefix-\c" >$ff
-if ! echo "$da" |$CMD >$tf 2>"$te" ||
+echo "$da" |$CMD >$tf 2>"$te"
+rc0=$?
+if ! [ $rc0 = 0 ] ||
     ! echo "$da" |diff - $ff >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD"
     cat "$te"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -3589,7 +3792,7 @@ N=$((N+1))
 
 NAME=FTRUNCATE
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: option ftruncate"
 if ! eval $NUMCOND; then :; else
 ff="$td/test$N.file"
@@ -3597,16 +3800,17 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD="$SOCAT -u $opts - open:$ff,append,ftruncate=0"
+CMD="$TRACE $SOCAT -u $opts - open:$ff,append,ftruncate=0"
 printf "test $F_n $TEST... " $N
 rm -f $ff; $ECHO "prefix-\c" >$ff
 if ! echo "$da" |$CMD >$tf 2>"$te" ||
     ! echo "$da" |diff - $ff >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD"
     cat "$te"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -3619,7 +3823,7 @@ N=$((N+1))
 
 NAME=RIGHTTOLEFT
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: unidirectional throughput from stdin to stdout, right to left"
 testecho "$N" "$TEST" "stdout" "stdin" "$opts -U"
 esac
@@ -3628,12 +3832,12 @@ N=$((N+1))
 
 NAME=CHILDDEFAULT
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 if ! eval $NUMCOND; then :; else
 TEST="$NAME: child process default properties"
 tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
-CMD="$SOCAT $opts -u exec:$PROCAN -"
+CMD="$TRACE $SOCAT $opts -u exec:$PROCAN -"
 printf "test $F_n $TEST... " $N
 $CMD >$tf 2>$te
 MYPID=`expr "\`grep "process id =" $tf\`" : '[^0-9]*\([0-9]*\).*'`
@@ -3648,6 +3852,7 @@ then
     echo "$CMD"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
    numOK=$((numOK+1))
@@ -3659,12 +3864,12 @@ N=$((N+1))
 
 NAME=CHILDSETSID
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: child process with setsid"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
-CMD="$SOCAT $opts -u exec:$PROCAN,setsid -"
+CMD="$TRACE $SOCAT $opts -u exec:$PROCAN,setsid -"
 printf "test $F_n $TEST... " $N
 $CMD >$tf 2>$te
 MYPID=`grep "process id =" $tf |(expr "\`cat\`" : '[^0-9]*\([0-9]*\).*')`
@@ -3680,6 +3885,7 @@ then
     echo "$CMD"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -3691,12 +3897,12 @@ N=$((N+1))
 
 NAME=MAINSETSID
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: main process with setsid"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
-CMD="$SOCAT $opts -U -,setsid exec:$PROCAN"
+CMD="$TRACE $SOCAT $opts -U -,setsid exec:$PROCAN"
 printf "test $F_n $TEST... " $N
 $CMD >$tf 2>$te
 MYPID=`grep "process id =" $tf |(expr "\`cat\`" : '[^0-9]*\([0-9]*\).*')`
@@ -3712,6 +3918,7 @@ then
     echo "$CMD"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -3723,7 +3930,7 @@ N=$((N+1))
 
 NAME=OPENSSL_TCP4
 case "$TESTS" in
-*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: openssl connect"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -3741,9 +3948,9 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD2="$SOCAT $opts exec:'openssl s_server -accept "$PORT" -quiet -cert testsrv.pem' pipe"
-#! CMD="$SOCAT $opts - openssl:$LOCALHOST:$PORT"
-CMD="$SOCAT $opts - openssl:$LOCALHOST:$PORT,pf=ip4,verify=0,$SOCAT_EGD"
+CMD2="$TRACE $SOCAT $opts exec:'openssl s_server -accept "$PORT" -quiet -cert testsrv.pem' pipe"
+#! CMD="$TRACE $SOCAT $opts - openssl:$LOCALHOST:$PORT"
+CMD="$TRACE $SOCAT $opts - openssl:$LOCALHOST:$PORT,pf=ip4,verify=0,$SOCAT_EGD"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
@@ -3751,20 +3958,20 @@ pid=$!	# background process id
 waittcp4port $PORT
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
    numOK=$((numOK+1))
 fi
-kill $pid 2>/dev/null
-wait
+kill $pid 2>/dev/null; wait
 fi ;; # NUMCOND, feats
 esac
 PORT=$((PORT+1))
@@ -3773,7 +3980,7 @@ N=$((N+1))
 
 NAME=OPENSSLLISTEN_TCP4
 case "$TESTS" in
-*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: openssl listen"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -3788,21 +3995,22 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD2="$SOCAT $opts OPENSSL-LISTEN:$PORT,pf=ip4,reuseaddr,$SOCAT_EGD,cert=testsrv.crt,key=testsrv.key,verify=0 pipe"
-CMD="$SOCAT $opts - openssl:$LOCALHOST:$PORT,pf=ip4,verify=0,$SOCAT_EGD"
+CMD2="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,pf=ip4,reuseaddr,$SOCAT_EGD,cert=testsrv.crt,key=testsrv.key,verify=0 pipe"
+CMD="$TRACE $SOCAT $opts - openssl:$LOCALHOST:$PORT,pf=ip4,verify=0,$SOCAT_EGD"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp4port $PORT
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -3817,7 +4025,7 @@ N=$((N+1))
 
 NAME=OPENSSLLISTEN_TCP6
 case "$TESTS" in
-*%functions%*|*%openssl%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%$NAME%*)
 TEST="$NAME: openssl listen"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -3832,21 +4040,22 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD2="$SOCAT $opts OPENSSL-LISTEN:$PORT,pf=ip6,reuseaddr,$SOCAT_EGD,cert=testsrv.crt,key=testsrv.key,verify=0 pipe"
-CMD="$SOCAT $opts - openssl:$LOCALHOST6:$PORT,verify=0,$SOCAT_EGD"
+CMD2="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,pf=ip6,reuseaddr,$SOCAT_EGD,cert=testsrv.crt,key=testsrv.key,verify=0 pipe"
+CMD="$TRACE $SOCAT $opts - openssl:$LOCALHOST6:$PORT,verify=0,$SOCAT_EGD"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp6port $PORT
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -3873,7 +4082,7 @@ TESTKEYW=${TESTADDR%%:*}
 # does our address implementation support halfclose?
 NAME=${NAMEKEYW}_HALFCLOSE
 case "$TESTS" in
-*%functions%*|*%socket%*|*%halfclose%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$FEAT%*|*%socket%*|*%halfclose%*|*%$NAME%*)
 TEST="$NAME: $TESTKEYW half close"
 # have a "peer" socat "peer" that executes "$OD_C" and see if EOF on the
 # connecting socat  brings the result of od
@@ -3889,21 +4098,22 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD2="$SOCAT $opts \"$PEERADDR\" EXEC:'$OD_C'"
-CMD="$SOCAT -T1 $opts - $TESTADDR"
+CMD2="$TRACE $SOCAT $opts \"$PEERADDR\" EXEC:'$OD_C'"
+CMD="$TRACE $SOCAT -T1 $opts - $TESTADDR"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 $WAITCMD
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |$OD_C |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -3934,7 +4144,7 @@ OPENSSL6SERVER   OPENSSL tcp6 OPENSSL-LISTEN:\$PORT,pf=ip6,$SOCAT_EGD,cert=tests
 
 NAME=OPENSSL_SERVERAUTH
 case "$TESTS" in
-*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: openssl server authentication"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -3950,21 +4160,22 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD2="$SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,$SOCAT_EGD,cert=testsrv.crt,key=testsrv.key,verify=0 pipe"
-CMD="$SOCAT $opts - openssl:$LOCALHOST:$PORT,verify=1,cafile=testsrv.crt,$SOCAT_EGD"
+CMD2="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,$SOCAT_EGD,cert=testsrv.crt,key=testsrv.key,verify=0 pipe"
+CMD="$TRACE $SOCAT $opts - openssl:$LOCALHOST:$PORT,verify=1,cafile=testsrv.crt,$SOCAT_EGD"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp4port $PORT
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -3979,7 +4190,7 @@ N=$((N+1))
 
 NAME=OPENSSL_CLIENTAUTH
 case "$TESTS" in
-*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: openssl client authentication"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -3995,21 +4206,22 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD2="$SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,verify=1,cert=testsrv.crt,key=testsrv.key,cafile=testcli.crt,$SOCAT_EGD pipe"
-CMD="$SOCAT $opts - openssl:$LOCALHOST:$PORT,verify=0,cert=testcli.crt,key=testcli.key,$SOCAT_EGD"
+CMD2="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,verify=1,cert=testsrv.crt,key=testsrv.key,cafile=testcli.crt,$SOCAT_EGD pipe"
+CMD="$TRACE $SOCAT $opts - openssl:$LOCALHOST:$PORT,verify=0,cert=testcli.crt,key=testcli.key,$SOCAT_EGD"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp4port $PORT
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4024,7 +4236,7 @@ N=$((N+1))
 
 NAME=OPENSSL_FIPS_BOTHAUTH
 case "$TESTS" in
-*%functions%*|*%openssl%*|*%fips%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%fips%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: OpenSSL+FIPS client and server authentication"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -4043,21 +4255,22 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD2="$SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,fips,$SOCAT_EGD,cert=testsrvfips.crt,key=testsrvfips.key,cafile=testclifips.crt pipe"
-CMD="$SOCAT $opts - openssl:$LOCALHOST:$PORT,fips,verify=1,cert=testclifips.crt,key=testclifips.key,cafile=testsrvfips.crt,$SOCAT_EGD"
+CMD2="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,fips,$SOCAT_EGD,cert=testsrvfips.crt,key=testsrvfips.key,cafile=testclifips.crt pipe"
+CMD="$TRACE $SOCAT $opts - openssl:$LOCALHOST:$PORT,fips,verify=1,cert=testclifips.crt,key=testclifips.key,cafile=testsrvfips.crt,$SOCAT_EGD"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp4port $PORT
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4073,7 +4286,7 @@ N=$((N+1))
 
 NAME=OPENSSL_COMPRESS
 case "$TESTS" in
-*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: OpenSSL compression"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -4095,8 +4308,8 @@ else
     success=yes
     for srccompr in '' compress=auto compress=none; do
         for dstcompr in '' compress=auto compress=none; do
-            CMD2="$SOCAT $opts OPENSSL-LISTEN:$PORT,pf=ip4,reuseaddr,$SOCAT_EGD,cert=testsrv.crt,key=testsrv.key,verify=0,$dstcompr pipe"
-            CMD="$SOCAT $opts - openssl:$LOCALHOST:$PORT,pf=ip4,verify=0,$SOCAT_EGD,$srccompr"
+            CMD2="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,pf=ip4,reuseaddr,$SOCAT_EGD,cert=testsrv.crt,key=testsrv.key,verify=0,$dstcompr pipe"
+            CMD="$TRACE $SOCAT $opts - openssl:$LOCALHOST:$PORT,pf=ip4,verify=0,$SOCAT_EGD,$srccompr"
             eval "$CMD2 2>\"${te}1\" &"
             pid=$! # background process id
             waittcp4port $PORT
@@ -4109,13 +4322,14 @@ else
         done
     done
     if test -z "$success"; then
-        $PRINTF "$FAILED: $SOCAT:\n"
+        $PRINTF "$FAILED: $TRACE $SOCAT:\n"
         echo "$CMD2 &"
         echo "$CMD"
         cat "${te}1"
         cat "${te}2"
         cat "$tdiff"
         numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
     else
         $PRINTF "$OK\n"
         if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4129,7 +4343,7 @@ N=$((N+1))
 
 NAME=SOCKS4CONNECT_TCP4
 case "$TESTS" in
-*%functions%*|*%socks%*|*%socks4%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%socks%*|*%socks4%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: socks4 connect over TCP/IPv4"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs socks4 >/dev/null; then
@@ -4144,21 +4358,22 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
 # we have a normal tcp echo listening - so the socks header must appear in answer
-CMD2="$SOCAT $opts tcp4-l:$PORT,reuseaddr exec:\"./socks4echo.sh\""
-CMD="$SOCAT $opts - socks4:$LOCALHOST:32.98.76.54:32109,pf=ip4,socksport=$PORT",socksuser="nobody"
+CMD2="$TRACE $SOCAT $opts tcp4-l:$PORT,reuseaddr exec:\"./socks4echo.sh\""
+CMD="$TRACE $SOCAT $opts - socks4:$LOCALHOST:32.98.76.54:32109,pf=ip4,socksport=$PORT",socksuser="nobody"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp4port $PORT 1
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4173,7 +4388,7 @@ N=$((N+1))
 
 NAME=SOCKS4CONNECT_TCP6
 case "$TESTS" in
-*%functions%*|*%socks%*|*%socks4%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%socks%*|*%socks4%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%$NAME%*)
 TEST="$NAME: socks4 connect over TCP/IPv6"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs socks4 >/dev/null; then
@@ -4188,21 +4403,22 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
 # we have a normal tcp echo listening - so the socks header must appear in answer
-CMD2="$SOCAT $opts tcp6-l:$PORT,reuseaddr exec:\"./socks4echo.sh\""
-CMD="$SOCAT $opts - socks4:$LOCALHOST6:32.98.76.54:32109,socksport=$PORT",socksuser="nobody"
+CMD2="$TRACE $SOCAT $opts tcp6-l:$PORT,reuseaddr exec:\"./socks4echo.sh\""
+CMD="$TRACE $SOCAT $opts - socks4:$LOCALHOST6:32.98.76.54:32109,socksport=$PORT",socksuser="nobody"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp6port $PORT 1
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4218,7 +4434,7 @@ N=$((N+1))
 
 NAME=SOCKS4ACONNECT_TCP4
 case "$TESTS" in
-*%functions%*|*%socks%*|*%socks4a%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%socks%*|*%socks4a%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: socks4a connect over TCP/IPv4"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs socks4a >/dev/null; then
@@ -4233,21 +4449,22 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
 # we have a normal tcp echo listening - so the socks header must appear in answer
-CMD2="$SOCAT $opts tcp4-l:$PORT,reuseaddr exec:\"./socks4a-echo.sh\""
-CMD="$SOCAT $opts - socks4a:$LOCALHOST:localhost:32109,pf=ip4,socksport=$PORT",socksuser="nobody"
+CMD2="$TRACE $SOCAT $opts tcp4-l:$PORT,reuseaddr exec:\"./socks4a-echo.sh\""
+CMD="$TRACE $SOCAT $opts - socks4a:$LOCALHOST:localhost:32109,pf=ip4,socksport=$PORT",socksuser="nobody"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp4port $PORT 1
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4262,7 +4479,7 @@ N=$((N+1))
 
 NAME=SOCKS4ACONNECT_TCP6
 case "$TESTS" in
-*%functions%*|*%socks%*|*%socks4a%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%socks%*|*%socks4a%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%$NAME%*)
 TEST="$NAME: socks4a connect over TCP/IPv6"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs socks4a >/dev/null; then
@@ -4277,21 +4494,22 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
 # we have a normal tcp echo listening - so the socks header must appear in answer
-CMD2="$SOCAT $opts tcp6-l:$PORT,reuseaddr exec:\"./socks4a-echo.sh\""
-CMD="$SOCAT $opts - socks4a:$LOCALHOST6:localhost:32109,socksport=$PORT",socksuser="nobody"
+CMD2="$TRACE $SOCAT $opts tcp6-l:$PORT,reuseaddr exec:\"./socks4a-echo.sh\""
+CMD="$TRACE $SOCAT $opts - socks4a:$LOCALHOST6:localhost:32109,socksport=$PORT",socksuser="nobody"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp6port $PORT 1
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4307,7 +4525,7 @@ N=$((N+1))
 
 NAME=PROXYCONNECT_TCP4
 case "$TESTS" in
-*%functions%*|*%proxyconnect%*|*%proxy%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%proxyconnect%*|*%proxy%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: proxy connect over TCP/IPv4"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs proxy >/dev/null; then
@@ -4322,22 +4540,23 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
-#CMD2="$SOCAT tcp4-l:$PORT,crlf system:\"read; read; $ECHO \\\"HTTP/1.0 200 OK\n\\\"; cat\""
-CMD2="$SOCAT $opts tcp4-l:$PORT,reuseaddr,crlf exec:\"/bin/bash proxyecho.sh\""
-CMD="$SOCAT $opts - proxy:$LOCALHOST:127.0.0.1:1000,pf=ip4,proxyport=$PORT"
+#CMD2="$TRACE $SOCAT tcp4-l:$PORT,crlf SYSTEM:\"read; read; $ECHO \\\"HTTP/1.0 200 OK\n\\\"; cat\""
+CMD2="$TRACE $SOCAT $opts tcp4-l:$PORT,reuseaddr,crlf exec:\"/bin/bash proxyecho.sh\""
+CMD="$TRACE $SOCAT $opts - proxy:$LOCALHOST:127.0.0.1:1000,pf=ip4,proxyport=$PORT"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}2\" &"
 pid=$!	# background process id
 waittcp4port $PORT 1
 echo "$da" |$CMD >"$tf" 2>"${te}1"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4352,7 +4571,7 @@ N=$((N+1))
 
 NAME=PROXYCONNECT_TCP6
 case "$TESTS" in
-*%functions%*|*%proxyconnect%*|*%proxy%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%proxyconnect%*|*%proxy%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%$NAME%*)
 TEST="$NAME: proxy connect over TCP/IPv6"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs proxy >/dev/null; then
@@ -4367,22 +4586,23 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
-#CMD2="$SOCAT $opts tcp6-l:$PORT,crlf system:\"read; read; $ECHO \\\"HTTP/1.0 200 OK\n\\\"; cat\""
-CMD2="$SOCAT $opts tcp6-l:$PORT,reuseaddr,crlf exec:\"/bin/bash proxyecho.sh\""
-CMD="$SOCAT $opts - proxy:$LOCALHOST6:127.0.0.1:1000,proxyport=$PORT"
+#CMD2="$TRACE $SOCAT $opts tcp6-l:$PORT,crlf SYSTEM:\"read; read; $ECHO \\\"HTTP/1.0 200 OK\n\\\"; cat\""
+CMD2="$TRACE $SOCAT $opts tcp6-l:$PORT,reuseaddr,crlf exec:\"/bin/bash proxyecho.sh\""
+CMD="$TRACE $SOCAT $opts - proxy:$LOCALHOST6:127.0.0.1:1000,proxyport=$PORT"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}2\" &"
 pid=$!	# background process id
 waittcp6port $PORT 1
 echo "$da" |$CMD >"$tf" 2>"${te}1"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4398,7 +4618,7 @@ N=$((N+1))
 
 NAME=TCP4NOFORK
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: echo via connection to TCP V4 socket with nofork'ed exec"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
@@ -4407,8 +4627,8 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP4-LISTEN:$tsl,reuseaddr exec:$CAT,nofork"
-CMD2="$SOCAT $opts stdin!!stdout TCP4:$ts"
+CMD1="$TRACE $SOCAT $opts TCP4-LISTEN:$tsl,reuseaddr exec:$CAT,nofork"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP4:$ts"
 printf "test $F_n $TEST... " $N
 #$CMD1 >"$tf" 2>"${te}1" &
 $CMD1 >/dev/null 2>"${te}1" &
@@ -4416,16 +4636,18 @@ waittcp4port $tsl
 #usleep $MICROS
 echo "$da" |$CMD2 >"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4439,7 +4661,7 @@ N=$((N+1))
 
 NAME=EXECCATNOFORK
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: simple echo via exec of cat with nofork"
 testecho "$N" "$TEST" "" "exec:$CAT,nofork" "$opts"
 esac
@@ -4448,7 +4670,7 @@ N=$((N+1))
 
 NAME=SYSTEMCATNOFORK
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: simple echo via system() of cat with nofork"
 testecho "$N" "$TEST" "" "system:$CAT,nofork" "$opts"
 esac
@@ -4457,7 +4679,7 @@ N=$((N+1))
 
 NAME=NOFORKSETSID
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: simple echo via exec() of cat with nofork and setsid"
 testecho "$N" "$TEST" "" "system:$CAT,nofork,setsid" "$opts"
 esac
@@ -4470,15 +4692,16 @@ N=$((N+1))
 #tsl=65534
 #ts="127.0.0.1:$tsl"
 #da="test$N $(date) $RANDOM"
-#$SOCAT UDP-listen:$tsl PIPE &
+#$TRACE $SOCAT UDP-listen:$tsl PIPE &
 #sleep 2
-#echo "$da" |$SOCAT stdin!!stdout UDP:$ts >"$tf"
+#echo "$da" |$TRACE $SOCAT stdin!!stdout UDP:$ts >"$tf"
 #if [ $? -eq 0 ] && echo "$da" |diff "$tf" -; then
 #   $ECHO "... test $N succeeded"
 #   numOK=$((numOK+1))
 #else
 #   $ECHO "*** test $N $FAILED"
 #    numFAIL=$((numFAIL+1))
+#    listFAIL="$listFAIL $N"
 #fi
 #fi ;; # NUMCOND
 #N=$((N+1))
@@ -4490,13 +4713,14 @@ N=$((N+1))
 #tp="$td/pipe$N"
 #da="test$N $(date) $RANDOM"
 #rm -f "$tf.tmp"
-#echo "$da" |$SOCAT - FILE:$tf.tmp,ignoreeof >"$tf"
+#echo "$da" |$TRACE $SOCAT - FILE:$tf.tmp,ignoreeof >"$tf"
 #if [ $? -eq 0 ] && echo "$da" |diff "$tf" -; then
 #   $ECHO "... test $N succeeded"
 #   numOK=$((numOK+1))
 #else
 #   $ECHO "*** test $N $FAILED"
 #   numFAIL=$((numFAIL+1))
+#    listFAIL="$listFAIL $N"
 #fi
 #fi ;; # NUMCOND
 
@@ -4504,7 +4728,7 @@ N=$((N+1))
 
 NAME=TOTALTIMEOUT
 case "$TESTS" in
-*%functions%*|*%engine%*|*%timeout%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%timeout%*|*%$NAME%*)
 TEST="$NAME: socat inactivity timeout"
 if ! eval $NUMCOND; then :; else
 #set -vx
@@ -4512,21 +4736,22 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
-CMD2="$SOCAT $opts -T 1 tcp4-listen:$PORT,reuseaddr pipe"
-CMD="$SOCAT $opts - tcp4-connect:$LOCALHOST:$PORT"
+CMD2="$TRACE $SOCAT $opts -T 1 tcp4-listen:$PORT,reuseaddr pipe"
+CMD="$TRACE $SOCAT $opts - tcp4-connect:$LOCALHOST:$PORT"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>${te}1 &"
 pid=$!	# background process id
 waittcp4port $PORT 1
 (echo "$da"; sleep 2; echo X) |$CMD >"$tf" 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4543,7 +4768,7 @@ N=$((N+1))
 
 NAME=IGNOREEOF+TOTALTIMEOUT
 case "$TESTS" in
-*%functions%*|*%engine%*|*%timeout%*|*%ignoreeof%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%timeout%*|*%ignoreeof%*|*%$NAME%*)
 TEST="$NAME: ignoreeof and inactivity timeout"
 if ! eval $NUMCOND; then :; else
 #set -vx
@@ -4552,7 +4777,7 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD="$SOCAT $opts -T 2 -u file:\"$ti\",ignoreeof -"
+CMD="$TRACE $SOCAT $opts -T 2 -u file:\"$ti\",ignoreeof -"
 printf "test $F_n $TEST... " $N
 touch "$ti"
 $CMD >"$tf" 2>"$te" &
@@ -4564,11 +4789,12 @@ echo X >>"$ti"
 sleep 1
 kill $bg 2>/dev/null
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD &"
     cat "$te"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "$te"; fi
@@ -4582,7 +4808,7 @@ N=$((N+1))
 
 NAME=PROXY2SPACES
 case "$TESTS" in
-*%functions%*|*%proxy%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%proxy%*|*%$NAME%*)
 TEST="$NAME: proxy connect accepts status with multiple spaces"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs proxy >/dev/null; then
@@ -4594,22 +4820,23 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
-#CMD2="$SOCAT $opts tcp-l:$PORT,crlf system:\"read; read; $ECHO \\\"HTTP/1.0 200 OK\n\\\"; cat\""
-CMD2="$SOCAT $opts tcp4-l:$PORT,reuseaddr,crlf exec:\"/bin/bash proxyecho.sh -w 2\""
-CMD="$SOCAT $opts - proxy:$LOCALHOST:127.0.0.1:1000,pf=ip4,proxyport=$PORT"
+#CMD2="$TRACE $SOCAT $opts tcp-l:$PORT,crlf SYSTEM:\"read; read; $ECHO \\\"HTTP/1.0 200 OK\n\\\"; cat\""
+CMD2="$TRACE $SOCAT $opts tcp4-l:$PORT,reuseaddr,crlf exec:\"/bin/bash proxyecho.sh -w 2\""
+CMD="$TRACE $SOCAT $opts - proxy:$LOCALHOST:127.0.0.1:1000,pf=ip4,proxyport=$PORT"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp4port $PORT 1
 echo "$da" |$CMD >"$tf" 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -4625,7 +4852,7 @@ N=$((N+1))
 
 NAME=BUG-UNISTDIO
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: for bug with address options on both stdin/out in unidirectional mode"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
@@ -4633,8 +4860,8 @@ te="$td/test$N.stderr"
 ff="$td/file$N"
 printf "test $F_n $TEST... " $N
 >"$ff"
-#$SOCAT $opts -u /dev/null -,setlk <"$ff"  2>"$te"
-CMD="$SOCAT $opts -u /dev/null -,setlk"
+#$TRACE $SOCAT $opts -u /dev/null -,setlk <"$ff"  2>"$te"
+CMD="$TRACE $SOCAT $opts -u /dev/null -,setlk"
 $CMD <"$ff"  2>"$te"
 if [ "$?" -eq 0 ]; then
     $PRINTF "$OK\n"
@@ -4645,6 +4872,7 @@ else
 	echo "$CMD"
 	cat "$te"
 	numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
     else
 	$PRINTF "${YELLOW}failed (don't care)${NORMAL}\n"
 	numCANT=$((numCANT+1))
@@ -4657,7 +4885,7 @@ N=$((N+1))
 
 NAME=SINGLEEXECOUTSOCKETPAIR
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: inheritance of stdout to single exec with socketpair"
 testecho "$N" "$TEST" "-!!exec:cat" "" "$opts" 1
 esac
@@ -4665,7 +4893,7 @@ N=$((N+1))
 
 NAME=SINGLEEXECOUTPIPE
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: inheritance of stdout to single exec with pipe"
 testecho "$N" "$TEST" "-!!exec:cat,pipes" "" "$opts" 1
 esac
@@ -4673,7 +4901,7 @@ N=$((N+1))
 
 NAME=SINGLEEXECOUTPTY
 case "$TESTS" in
-*%functions%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: inheritance of stdout to single exec with pty"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs pty >/dev/null; then
@@ -4687,7 +4915,7 @@ N=$((N+1))
 
 NAME=SINGLEEXECINSOCKETPAIR
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: inheritance of stdin to single exec with socketpair"
 testecho "$N" "$TEST" "exec:cat!!-" "" "$opts"
 esac
@@ -4695,7 +4923,7 @@ N=$((N+1))
 
 NAME=SINGLEEXECINPIPE
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: inheritance of stdin to single exec with pipe"
 testecho "$N" "$TEST" "exec:cat,pipes!!-" "" "$opts"
 esac
@@ -4703,7 +4931,7 @@ N=$((N+1))
 
 NAME=SINGLEEXECINPTYDELAY
 case "$TESTS" in
-*%functions%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: inheritance of stdin to single exec with pty, with delay"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs pty >/dev/null; then
@@ -4717,7 +4945,7 @@ N=$((N+1))
 
 NAME=SINGLEEXECINPTY
 case "$TESTS" in
-*%functions%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: inheritance of stdin to single exec with pty"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs pty >/dev/null; then
@@ -4733,7 +4961,7 @@ N=$((N+1))
 NAME=READLINE
 #set -vx
 case "$TESTS" in
-*%functions%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: readline with password and sigint"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs readline pty); then
@@ -4752,7 +4980,7 @@ tr="$td/test$N.ref"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
 # the feature that we really want to test is in the readline.sh script:
-CMD="$SOCAT $opts -t1 open:$tpi,nonblock!!open:$tpo exec:\"./readline.sh -nh ./readline-test.sh\",pty,ctty,setsid,raw,echo=0,isig"
+CMD="$TRACE $SOCAT $opts -t1 open:$tpi,nonblock!!open:$tpo exec:\"./readline.sh -nh ./readline-test.sh\",pty,ctty,setsid,raw,echo=0,isig"
 #echo "$CMD" >"$ts"
 #chmod a+x "$ts"
 printf "test $F_n $TEST... " $N
@@ -4761,7 +4989,7 @@ mkfifo "$tpi"
 touch "$tpo"
 #
 # during development of this test, the following command line succeeded:
-# (sleep 1; $ECHO "user\n\c"; sleep 1; $ECHO "password\c"; sleep 1; $ECHO "\n\c"; sleep 1; $ECHO "test 1\n\c"; sleep 1; $ECHO "\003\c"; sleep 1; $ECHO "test 2\n\c"; sleep 1; $ECHO "exit\n\c"; sleep 1) |$SOCAT -d -d -d -d -lf/tmp/gerhard/debug1 -v -x - exec:'./readline.sh ./readline-test.sh',pty,ctty,setsid,raw,echo=0,isig
+# (sleep 1; $ECHO "user\n\c"; sleep 1; $ECHO "password\c"; sleep 1; $ECHO "\n\c"; sleep 1; $ECHO "test 1\n\c"; sleep 1; $ECHO "\003\c"; sleep 1; $ECHO "test 2\n\c"; sleep 1; $ECHO "exit\n\c"; sleep 1) |$TRACE $SOCAT -d -d -d -d -lf/tmp/gerhard/debug1 -v -x - exec:'./readline.sh ./readline-test.sh',pty,ctty,setsid,raw,echo=0,isig
 #
 PATH=${SOCAT%socat}:$PATH eval "$CMD 2>$te &"
 pid=$!	# background process id
@@ -4802,11 +5030,12 @@ EOF
 #0 if ! sed 's/.*'"$($ECHO '\r\c')"'/</g' "$tpo" |diff -q "$tr" - >/dev/null 2>&1; then
 wait
 if ! tr "$($ECHO '\r \c')" "% " <$tpo |sed 's/%$//g' |sed 's/.*%//g' |diff "$tr" - >"$tdiff" 2>&1; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD"
     cat "$te"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -4824,7 +5053,7 @@ N=$((N+1))
 
 NAME=GENDERCHANGER
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: TCP4 \"gender changer\""
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
@@ -4832,13 +5061,13 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
 # this is the server in the protected network that we want to reach
-CMD1="$SOCAT -lpserver $opts tcp4-l:$PORT,reuseaddr,bind=$LOCALHOST echo"
+CMD1="$TRACE $SOCAT -lpserver $opts tcp4-l:$PORT,reuseaddr,bind=$LOCALHOST echo"
 # this is the double client in the protected network
-CMD2="$SOCAT -lp2client $opts tcp4:$LOCALHOST:$((PORT+1)),retry=10,interval=1 tcp4:$LOCALHOST:$PORT"
+CMD2="$TRACE $SOCAT -lp2client $opts tcp4:$LOCALHOST:$((PORT+1)),retry=10,interval=1 tcp4:$LOCALHOST:$PORT"
 # this is the double server in the outside network
-CMD3="$SOCAT -lp2server $opts tcp4-l:$((PORT+2)),reuseaddr,bind=$LOCALHOST tcp4-l:$((PORT+1)),reuseaddr,bind=$LOCALHOST"
+CMD3="$TRACE $SOCAT -lp2server $opts tcp4-l:$((PORT+2)),reuseaddr,bind=$LOCALHOST tcp4-l:$((PORT+1)),reuseaddr,bind=$LOCALHOST"
 # this is the outside client that wants to use the protected server
-CMD4="$SOCAT -lpclient $opts -t1 - tcp4:$LOCALHOST:$((PORT+2))"
+CMD4="$TRACE $SOCAT -lpclient $opts -t1 - tcp4:$LOCALHOST:$((PORT+2))"
 printf "test $F_n $TEST... " $N
 eval "$CMD1 2>${te}1 &"
 pid1=$!
@@ -4851,14 +5080,15 @@ waittcp4port $((PORT+2)) 1
 sleep 1
 echo "$da" |$CMD4 >$tf 2>"${te}4"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     echo "$CMD2 &"
     echo "$CMD3 &"
     echo "$CMD4"
     cat "${te}1" "${te}2" "${te}3" "${te}4"
-    echo "$tdiff"
+    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat "${te}1" "${te}2" "${te}3" "${te}4"; fi
@@ -4877,7 +5107,7 @@ N=$((N+1))
 #!
 NAME=OUTBOUNDIN
 case "$TESTS" in
-*%functions%*|*%proxy%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%proxy%*|*%$NAME%*)
 TEST="$NAME: gender changer via SSL through HTTP proxy, oneshot"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs openssl proxy); then
@@ -4891,18 +5121,18 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
 # this is the server in the protected network that we want to reach
-CMD1="$SOCAT $opts -lpserver tcp4-l:$PORT,reuseaddr,bind=$LOCALHOST echo"
+CMD1="$TRACE $SOCAT $opts -lpserver tcp4-l:$PORT,reuseaddr,bind=$LOCALHOST echo"
 # this is the proxy in the protected network that provides a way out
-CMD2="$SOCAT $opts -lpproxy tcp4-l:$((PORT+1)),reuseaddr,bind=$LOCALHOST,fork exec:./proxy.sh"
+CMD2="$TRACE $SOCAT $opts -lpproxy tcp4-l:$((PORT+1)),reuseaddr,bind=$LOCALHOST,fork exec:./proxy.sh"
 # this is our proxy connect wrapper in the protected network
-CMD3="$SOCAT $opts -lpwrapper tcp4-l:$((PORT+2)),reuseaddr,bind=$LOCALHOST,fork proxy:$LOCALHOST:$LOCALHOST:$((PORT+3)),pf=ip4,proxyport=$((PORT+1)),resolve"
+CMD3="$TRACE $SOCAT $opts -lpwrapper tcp4-l:$((PORT+2)),reuseaddr,bind=$LOCALHOST,fork proxy:$LOCALHOST:$LOCALHOST:$((PORT+3)),pf=ip4,proxyport=$((PORT+1)),resolve"
 # this is our double client in the protected network using SSL
-#CMD4="$SOCAT $opts -lp2client ssl:$LOCALHOST:$((PORT+2)),pf=ip4,retry=10,interval=1,cert=testcli.pem,cafile=testsrv.crt,$SOCAT_EGD tcp4:$LOCALHOST:$PORT"
-CMD4="$SOCAT $opts -lp2client ssl:$LOCALHOST:$((PORT+2)),pf=ip4,cert=testcli.pem,cafile=testsrv.crt,$SOCAT_EGD tcp4:$LOCALHOST:$PORT"
+#CMD4="$TRACE $SOCAT $opts -lp2client ssl:$LOCALHOST:$((PORT+2)),pf=ip4,retry=10,interval=1,cert=testcli.pem,cafile=testsrv.crt,$SOCAT_EGD tcp4:$LOCALHOST:$PORT"
+CMD4="$TRACE $SOCAT $opts -lp2client ssl:$LOCALHOST:$((PORT+2)),pf=ip4,cert=testcli.pem,cafile=testsrv.crt,$SOCAT_EGD tcp4:$LOCALHOST:$PORT"
 # this is the double server in the outside network
-CMD5="$SOCAT $opts -lp2server -t1 tcp4-l:$((PORT+4)),reuseaddr,bind=$LOCALHOST ssl-l:$((PORT+3)),pf=ip4,reuseaddr,bind=$LOCALHOST,$SOCAT_EGD,cert=testsrv.pem,cafile=testcli.crt"
+CMD5="$TRACE $SOCAT $opts -lp2server -t1 tcp4-l:$((PORT+4)),reuseaddr,bind=$LOCALHOST ssl-l:$((PORT+3)),pf=ip4,reuseaddr,bind=$LOCALHOST,$SOCAT_EGD,cert=testsrv.pem,cafile=testcli.crt"
 # this is the outside client that wants to use the protected server
-CMD6="$SOCAT $opts -lpclient -t5 - tcp4:$LOCALHOST:$((PORT+4))"
+CMD6="$TRACE $SOCAT $opts -lpclient -t5 - tcp4:$LOCALHOST:$((PORT+4))"
 printf "test $F_n $TEST... " $N
 eval "$CMD1 2>${te}1 &"
 pid1=$!
@@ -4923,7 +5153,7 @@ eval "$CMD4 2>${te}4 &"
 pid4=$!
 wait $pid6
 if ! (echo "$da"; sleep 2) |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     cat "${te}1"
     echo "$CMD2 &"
@@ -4938,6 +5168,7 @@ if ! (echo "$da"; sleep 2) |diff - "$tf" >"$tdiff"; then
     cat "${te}4"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat "${te}1" "${te}2" "${te}3" "${te}4" "${te}5" "${te}6"; fi
@@ -4962,7 +5193,7 @@ PORT=$((RANDOM+16184))
 #!
 NAME=INTRANETRIPPER
 case "$TESTS" in
-*%functions%*|*%proxy%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%proxy%*|*%$NAME%*)
 TEST="$NAME: gender changer via SSL through HTTP proxy, daemons"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs openssl proxy); then
@@ -4978,19 +5209,19 @@ da1="test$N.1 $(date) $RANDOM"
 da2="test$N.2 $(date) $RANDOM"
 da3="test$N.3 $(date) $RANDOM"
 # this is the server in the protected network that we want to reach
-CMD1="$SOCAT $opts -lpserver -t1 tcp4-l:$PORT,reuseaddr,bind=$LOCALHOST,fork echo"
+CMD1="$TRACE $SOCAT $opts -lpserver -t1 tcp4-l:$PORT,reuseaddr,bind=$LOCALHOST,fork echo"
 # this is the proxy in the protected network that provides a way out
 # note: the proxy.sh script starts one or two more socat processes without
 # setting the program name 
-CMD2="$SOCAT $opts -lpproxy -t1 tcp4-l:$((PORT+1)),reuseaddr,bind=$LOCALHOST,fork exec:./proxy.sh"
+CMD2="$TRACE $SOCAT $opts -lpproxy -t1 tcp4-l:$((PORT+1)),reuseaddr,bind=$LOCALHOST,fork exec:./proxy.sh"
 # this is our proxy connect wrapper in the protected network
-CMD3="$SOCAT $opts -lpwrapper -t3 tcp4-l:$((PORT+2)),reuseaddr,bind=$LOCALHOST,fork proxy:$LOCALHOST:$LOCALHOST:$((PORT+3)),pf=ip4,proxyport=$((PORT+1)),resolve"
+CMD3="$TRACE $SOCAT $opts -lpwrapper -t3 tcp4-l:$((PORT+2)),reuseaddr,bind=$LOCALHOST,fork proxy:$LOCALHOST:$LOCALHOST:$((PORT+3)),pf=ip4,proxyport=$((PORT+1)),resolve"
 # this is our double client in the protected network using SSL
-CMD4="$SOCAT $opts -lp2client -t3 ssl:$LOCALHOST:$((PORT+2)),retry=10,interval=1,cert=testcli.pem,cafile=testsrv.crt,verify,fork,$SOCAT_EGD tcp4:$LOCALHOST:$PORT,forever,interval=0.1"
+CMD4="$TRACE $SOCAT $opts -lp2client -t3 ssl:$LOCALHOST:$((PORT+2)),retry=10,interval=1,cert=testcli.pem,cafile=testsrv.crt,verify,fork,$SOCAT_EGD tcp4:$LOCALHOST:$PORT,forever,interval=0.1"
 # this is the double server in the outside network
-CMD5="$SOCAT $opts -lp2server -t4 tcp4-l:$((PORT+4)),reuseaddr,bind=$LOCALHOST,backlog=3,fork ssl-l:$((PORT+3)),pf=ip4,reuseaddr,bind=$LOCALHOST,$SOCAT_EGD,cert=testsrv.pem,cafile=testcli.crt,retry=20,interval=0.5"
+CMD5="$TRACE $SOCAT $opts -lp2server -t4 tcp4-l:$((PORT+4)),reuseaddr,bind=$LOCALHOST,backlog=3,fork ssl-l:$((PORT+3)),pf=ip4,reuseaddr,bind=$LOCALHOST,$SOCAT_EGD,cert=testsrv.pem,cafile=testcli.crt,retry=20,interval=0.5"
 # this is the outside client that wants to use the protected server
-CMD6="$SOCAT $opts -lpclient -t6 - tcp4:$LOCALHOST:$((PORT+4)),retry=3"
+CMD6="$TRACE $SOCAT $opts -lpclient -t6 - tcp4:$LOCALHOST:$((PORT+4)),retry=3"
 printf "test $F_n $TEST... " $N
 # start the intranet infrastructure
 eval "$CMD1 2>\"${te}1\" &"
@@ -5024,7 +5255,7 @@ wait $pid6_1 $pid6_2 $pid6_3
 if test -s "${tdiff}1" -o -s "${tdiff}2" -o -s "${tdiff}3"; then
   # FAILED only when none of the three transfers succeeded
   if test -s "${tdiff}1" -a -s "${tdiff}2" -a -s "${tdiff}3"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     cat "${te}1"
     echo "$CMD2 &"
@@ -5045,6 +5276,7 @@ if test -s "${tdiff}1" -o -s "${tdiff}2" -o -s "${tdiff}3"; then
     cat "${te}6_3"
     cat "${tdiff}3"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
   else
     $PRINTF "$OK ${YELLOW}(partial failure)${NORMAL}\n"
     if [ -n "$debug" ]; then cat "${te}1" "${te}2" "${te}3" "${te}4" "${te}5" ${te}6*; fi
@@ -5089,29 +5321,28 @@ testserversec () {
     local stat result
 
     $PRINTF "test $F_n %s... " $N "$title"
-#set -vx
     # first: without security
     # start server
-    $SOCAT $opts "$arg1,$secopt0" echo 2>"${te}1" &
+    $TRACE $SOCAT $opts "$arg1,$secopt0" echo 2>"${te}1" &
     spid=$!
     if [ "$port" ] && ! wait${proto}${ipvers}port $port 1; then
 	kill $spid 2>/dev/null
 	$PRINTF "$NO_RESULT (ph.1 server not working):\n"
-	echo "$SOCAT $opts \"$arg1,$secopt0\" echo &"
+	echo "$TRACE $SOCAT $opts \"$arg1,$secopt0\" echo &"
 	cat "${te}1"
 	numCANT=$((numCANT+1))
 	wait; return
     fi
     # now use client
-    (echo "$da"; sleep $T) |$SOCAT $opts - "$arg2" >"$tf" 2>"${te}2"
+    (echo "$da"; sleep $T) |$TRACE $SOCAT $opts - "$arg2" >"$tf" 2>"${te}2"
     stat="$?"
     kill $spid 2>/dev/null
-    #killall $SOCAT 2>/dev/null
+    #killall $TRACE $SOCAT 2>/dev/null
     if [ "$stat" != 0 ]; then
-	$PRINTF "$NO_RESULT (ph.1 function fails): $SOCAT:\n"
-	echo "$SOCAT $opts \"$arg1,$secopt0\" echo &"
+	$PRINTF "$NO_RESULT (ph.1 function fails): $TRACE $SOCAT:\n"
+	echo "$TRACE $SOCAT $opts \"$arg1,$secopt0\" echo &"
 	cat "${te}1"
-	echo "$SOCAT $opts - \"$arg2\""
+	echo "$TRACE $SOCAT $opts - \"$arg2\""
 	cat "${te}2"
 	numCANT=$((numCANT+1))
 	wait; return
@@ -5119,9 +5350,9 @@ testserversec () {
 	:	# function without security is ok, go on
     else
 	$PRINTF "$NO_RESULT (ph.1 function fails): diff:\n"
-	echo "$SOCAT $opts $arg1,$secopt0 echo &"
+	echo "$TRACE $SOCAT $opts $arg1,$secopt0 echo &"
 	cat "${te}1"
-	echo "$SOCAT $opts - $arg2"
+	echo "$TRACE $SOCAT $opts - $arg2"
 	cat "${te}2"
 	cat "$tdiff1"
 	numCANT=$((numCANT+1))
@@ -5143,7 +5374,7 @@ testserversec () {
     *)    arg="$arg1,$secopt1" ;;
     esac
     # start server
-    CMD3="$SOCAT $opts $arg echo"
+    CMD3="$TRACE $SOCAT $opts $arg echo"
     $CMD3 2>"${te}3" &
     spid=$!
     if [ "$port" ] && ! wait${proto}${ipvers}port $port 1; then
@@ -5157,11 +5388,11 @@ testserversec () {
     fi
     # now use client
     da="test$N.2 $(date) $RANDOM"
-    (echo "$da"; sleep $T) |$SOCAT $opts - "$arg2" >"$tf" 2>"${te}4"
+    (echo "$da"; sleep $T) |$TRACE $SOCAT $opts - "$arg2" >"$tf" 2>"${te}4"
     stat=$?
     kill $spid 2>/dev/null
 #set +vx
-    #killall $SOCAT 2>/dev/null
+    #killall $TRACE $SOCAT 2>/dev/null
     if [ "$stat" != 0 ]; then
 	result=-1;	# socat had error
     elif [ ! -s "$tf" ]; then
@@ -5173,33 +5404,35 @@ testserversec () {
     fi
     if [ X$result != X$expect ]; then
 	case X$result in
-	X-1) $PRINTF "$NO_RESULT (ph.2 client error): $SOCAT:\n"
-	    echo "$SOCAT $opts $arg echo"
+	X-1) $PRINTF "$NO_RESULT (ph.2 client error): $TRACE $SOCAT:\n"
+	    echo "$TRACE $SOCAT $opts $arg echo"
 	    cat "${te}3"
-	    echo "$SOCAT $opts - $arg2"
+	    echo "$TRACE $SOCAT $opts - $arg2"
 	    cat "${te}4"
 	    numCANT=$((numCANT+1)) ;;
 	X0) $PRINTF "$NO_RESULT (ph.2 diff failed): diff:\n"
-	    echo "$SOCAT $opts $arg echo"
+	    echo "$TRACE $SOCAT $opts $arg echo"
 	    cat "${te}3"
-	    echo "$SOCAT $opts - $arg2"
+	    echo "$TRACE $SOCAT $opts - $arg2"
 	    cat "${te}4"
 	    cat "$tdiff2"
 	    numCANT=$((numCANT+1)) ;;
 	X1) $PRINTF "$FAILED: SECURITY BROKEN\n"
-	    echo "$SOCAT $opts $arg echo"
+	    echo "$TRACE $SOCAT $opts $arg echo"
 	    cat "${te}3"
-	    echo "$SOCAT $opts - $arg2"
+	    echo "$TRACE $SOCAT $opts - $arg2"
 	    cat "${te}4"
 	    cat "$tdiff2"
-	    numFAIL=$((numFAIL+1)) ;;
+	    numFAIL=$((numFAIL+1))
+	    listFAIL="$listFAIL $N" ;;
 	X2) $PRINTF "$FAILED: diff:\n"
-	    echo "$SOCAT $opts $arg echo"
+	    echo "$TRACE $SOCAT $opts $arg echo"
 	    cat "${te}3"
-	    echo "$SOCAT $opts - $arg2"
+	    echo "$TRACE $SOCAT $opts - $arg2"
 	    cat "${te}4"
 	    cat "$tdiff2"
-	    numFAIL=$((numFAIL+1)) ;;
+	    numFAIL=$((numFAIL+1))
+	    listFAIL="$listFAIL $N" ;;
 	esac
     else
 	$PRINTF "$OK\n"
@@ -5213,7 +5446,7 @@ testserversec () {
 
 NAME=TCP4RANGEBITS
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of TCP4-L with RANGE option"
 if ! eval $NUMCOND; then :;
 elif [ -z "$SECONDADDR" ]; then
@@ -5229,7 +5462,7 @@ N=$((N+1))
 
 NAME=TCP4RANGEMASK
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of TCP4-L with RANGE option"
 if ! eval $NUMCOND; then :;
 elif [ -z "$SECONDADDR" ]; then
@@ -5246,7 +5479,7 @@ N=$((N+1))
 # like TCP4RANGEMASK, but the "bad" address is within the same class A network
 NAME=TCP4RANGEMASKHAIRY
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of TCP4-L with RANGE option"
 if ! eval $NUMCOND; then :; else
 testserversec "$N" "$TEST" "$opts -s" "tcp4-l:$PORT,reuseaddr,fork,retry=1" "" "range=127.0.0.0:255.255.0.0" "tcp4:$SECONDADDR:$PORT,bind=$SECONDADDR" 4 tcp $PORT 0
@@ -5258,7 +5491,7 @@ N=$((N+1))
 
 NAME=TCP4SOURCEPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%sourceport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%sourceport%*|*%$NAME%*)
 TEST="$NAME: security of TCP4-L with SOURCEPORT option"
 if ! eval $NUMCOND; then :; else
 testserversec "$N" "$TEST" "$opts -s" "tcp4-l:$PORT,reuseaddr,fork,retry=1" "" "sp=$PORT" "tcp4:127.0.0.1:$PORT" 4 tcp $PORT 0
@@ -5269,7 +5502,7 @@ N=$((N+1))
 
 NAME=TCP4LOWPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%lowport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%lowport%*|*%$NAME%*)
 TEST="$NAME: security of TCP4-L with LOWPORT option"
 if ! eval $NUMCOND; then :; else
 testserversec "$N" "$TEST" "$opts -s" "tcp4-l:$PORT,reuseaddr,fork,retry=1" "" "lowport" "tcp4:127.0.0.1:$PORT" 4 tcp $PORT 0
@@ -5280,7 +5513,7 @@ N=$((N+1))
 
 NAME=TCP4WRAPPERS_ADDR
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of TCP4-L with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip4 libwrap) || ! runsip4 >/dev/null; then
@@ -5299,7 +5532,7 @@ N=$((N+1))
 
 NAME=TCP4WRAPPERS_NAME
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of TCP4-L with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip4 libwrap) || ! runsip4 >/dev/null; then
@@ -5319,7 +5552,7 @@ N=$((N+1))
 
 NAME=TCP6RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of TCP6-L with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip6) || ! runsip6 >/dev/null; then
@@ -5334,7 +5567,7 @@ N=$((N+1))
 
 NAME=TCP6SOURCEPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%sourceport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%sourceport%*|*%$NAME%*)
 TEST="$NAME: security of TCP6-L with SOURCEPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip6) || ! runsip6 >/dev/null; then
@@ -5349,7 +5582,7 @@ N=$((N+1))
 
 NAME=TCP6LOWPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%lowport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%lowport%*|*%$NAME%*)
 TEST="$NAME: security of TCP6-L with LOWPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip6) || ! runsip6 >/dev/null; then
@@ -5364,7 +5597,7 @@ N=$((N+1))
 
 NAME=TCP6TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of TCP6-L with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip6 libwrap) || ! runsip6 >/dev/null; then
@@ -5384,7 +5617,7 @@ N=$((N+1))
 
 NAME=UDP4RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-L with RANGE option"
 if ! eval $NUMCOND; then :; else
 #testserversec "$N" "$TEST" "$opts -s" "udp4-l:$PORT,reuseaddr,fork" "" "range=$SECONDADDR/32" "udp4:127.0.0.1:$PORT" 4 udp $PORT 0
@@ -5396,7 +5629,7 @@ N=$((N+1))
 
 NAME=UDP4SOURCEPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%sourceport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%sourceport%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-L with SOURCEPORT option"
 if ! eval $NUMCOND; then :; else
 testserversec "$N" "$TEST" "$opts -s" "udp4-l:$PORT,reuseaddr" "" "sp=$PORT" "udp4:127.0.0.1:$PORT" 4 udp $PORT 0
@@ -5407,7 +5640,7 @@ N=$((N+1))
 
 NAME=UDP4LOWPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%lowport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%lowport%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-L with LOWPORT option"
 if ! eval $NUMCOND; then :; else
 testserversec "$N" "$TEST" "$opts -s" "udp4-l:$PORT,reuseaddr" "" "lowport" "udp4:127.0.0.1:$PORT" 4 udp $PORT 0
@@ -5418,7 +5651,7 @@ N=$((N+1))
 
 NAME=UDP4TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-L with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip4 libwrap) || ! runsip4 >/dev/null; then
@@ -5438,7 +5671,7 @@ N=$((N+1))
 
 NAME=UDP6RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-L with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip6) || ! runsip6 >/dev/null; then
@@ -5454,7 +5687,7 @@ N=$((N+1))
 
 NAME=UDP6SOURCEPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%sourceport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%sourceport%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-L with SOURCEPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6) || ! runsip6 >/dev/null; then
@@ -5469,7 +5702,7 @@ N=$((N+1))
 
 NAME=UDP6LOWPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%lowport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%lowport%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-L with LOWPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6) || ! runsip6 >/dev/null; then
@@ -5484,7 +5717,7 @@ N=$((N+1))
 
 NAME=UDP6TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-L with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip6 libwrap) || ! runsip6 >/dev/null; then
@@ -5504,7 +5737,7 @@ N=$((N+1))
 
 NAME=OPENSSLTCP4_RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of SSL-L over TCP/IPv4 with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -5512,7 +5745,7 @@ elif ! testaddrs openssl >/dev/null; then
     numCANT=$((numCANT+1))
 else
 gentestcert testsrv
-testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip4,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "range=$SECONDADDR/32" "ssl:127.0.0.1:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 4 tcp $PORT -1
+testserversec "$N" "$TEST" "$opts -s" "SSL-L:$PORT,pf=ip4,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "range=$SECONDADDR/32" "SSL:$LOCALHOST:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 4 tcp $PORT -1
 fi ;; # NUMCOND, feats
 esac
 PORT=$((PORT+1))
@@ -5520,7 +5753,7 @@ N=$((N+1))
 
 NAME=OPENSSLTCP4_SOURCEPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%sourceport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%sourceport%*|*%$NAME%*)
 TEST="$NAME: security of SSL-L with SOURCEPORT option"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -5528,7 +5761,7 @@ elif ! testaddrs openssl >/dev/null; then
     numCANT=$((numCANT+1))
 else
 gentestcert testsrv
-testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip4,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "sp=$PORT" "ssl:127.0.0.1:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 4 tcp $PORT -1
+testserversec "$N" "$TEST" "$opts -s" "SSL-L:$PORT,pf=ip4,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "sp=$PORT" "SSL:$LOCALHOST:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 4 tcp $PORT -1
 fi ;; # NUMCOND, feats
 esac
 PORT=$((PORT+1))
@@ -5536,7 +5769,7 @@ N=$((N+1))
 
 NAME=OPENSSLTCP4_LOWPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%lowport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%lowport%*|*%$NAME%*)
 TEST="$NAME: security of SSL-L with LOWPORT option"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -5544,7 +5777,7 @@ elif ! testaddrs openssl >/dev/null; then
     numCANT=$((numCANT+1))
 else
 gentestcert testsrv
-testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip4,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "lowport" "ssl:127.0.0.1:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 4 tcp $PORT -1
+testserversec "$N" "$TEST" "$opts -s" "SSL-L:$PORT,pf=ip4,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "lowport" "SSL:$LOCALHOST:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 4 tcp $PORT -1
 fi ;; # NUMCOND, feats
 esac
 PORT=$((PORT+1))
@@ -5552,7 +5785,7 @@ N=$((N+1))
 
 NAME=OPENSSLTCP4_TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of SSL-L with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4 tcp libwrap openssl); then
@@ -5564,7 +5797,7 @@ ha="$td/hosts.allow"
 hd="$td/hosts.deny"
 $ECHO "socat: $SECONDADDR" >"$ha"
 $ECHO "ALL: ALL" >"$hd"
-testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip4,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "tcpwrap-etc=$td" "ssl:127.0.0.1:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 4 tcp $PORT -1
+testserversec "$N" "$TEST" "$opts -s" "SSL-L:$PORT,pf=ip4,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "tcpwrap-etc=$td" "SSL:$LOCALHOST:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 4 tcp $PORT -1
 fi ;; # NUMCOND, feats
 esac
 PORT=$((PORT+1))
@@ -5572,7 +5805,7 @@ N=$((N+1))
 
 NAME=OPENSSLCERTSERVER
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%$NAME%*)
 TEST="$NAME: security of SSL-L with client certificate"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -5581,7 +5814,7 @@ elif ! testaddrs openssl >/dev/null; then
 else
 gentestcert testsrv
 gentestcert testcli
-testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip4,reuseaddr,fork,retry=1,$SOCAT_EGD,verify,cert=testsrv.crt,key=testsrv.key" "cafile=testcli.crt" "cafile=testsrv.crt" "ssl:127.0.0.1:$PORT,cafile=testsrv.crt,cert=testcli.pem,$SOCAT_EGD" 4 tcp $PORT -1
+testserversec "$N" "$TEST" "$opts -s" "SSL-L:$PORT,pf=ip4,reuseaddr,fork,retry=1,$SOCAT_EGD,verify,cert=testsrv.crt,key=testsrv.key" "cafile=testcli.crt" "cafile=testsrv.crt" "SSL:$LOCALHOST:$PORT,cafile=testsrv.crt,cert=testcli.pem,$SOCAT_EGD" 4 tcp $PORT -1
 fi ;; # NUMCOND, feats
 esac
 PORT=$((PORT+1))
@@ -5589,7 +5822,7 @@ N=$((N+1))
 
 NAME=OPENSSLCERTCLIENT
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%openssl%*|*%$NAME%*)
 TEST="$NAME: security of SSL with server certificate"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -5607,7 +5840,7 @@ N=$((N+1))
 
 NAME=OPENSSLTCP6_RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%openssl%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%openssl%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of SSL-L over TCP/IPv6 with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -5617,8 +5850,8 @@ elif ! feat=$(testaddrs tcp ip6) || ! runsip6 >/dev/null; then
     $PRINTF "test $F_n $TEST... ${YELLOW}TCP6 not available${NORMAL}\n" $N
     numCANT=$((numCANT+1))
 else
-gentestcert testsrv
-testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip6,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "range=[::2/128]" "ssl:[::1]:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 6 tcp $PORT -1
+gentestcert6 testsrv6
+testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip6,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv6.crt,key=testsrv6.key" "" "range=[::2/128]" "ssl:[::1]:$PORT,cafile=testsrv6.crt,$SOCAT_EGD" 6 tcp $PORT -1
 fi ;; # NUMCOND, feats
 esac
 PORT=$((PORT+1))
@@ -5626,7 +5859,7 @@ N=$((N+1))
 
 NAME=OPENSSLTCP6_SOURCEPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%openssl%*|*%sourceport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%openssl%*|*%sourceport%*|*%$NAME%*)
 TEST="$NAME: security of SSL-L over TCP/IPv6 with SOURCEPORT option"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -5636,8 +5869,8 @@ elif ! feat=$(testaddrs tcp ip6) || ! runsip6 >/dev/null; then
     $PRINTF "test $F_n $TEST... ${YELLOW}TCP6 not available${NORMAL}\n" $N
     numCANT=$((numCANT+1))
 else
-gentestcert testsrv
-testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip6,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "sp=$PORT" "ssl:[::1]:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 6 tcp $PORT -1
+gentestcert6 testsrv6
+testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip6,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv6.crt,key=testsrv6.key" "" "sp=$PORT" "ssl:[::1]:$PORT,cafile=testsrv6.crt,$SOCAT_EGD" 6 tcp $PORT -1
 fi ;; # NUMCOND, feats
 esac
 PORT=$((PORT+1))
@@ -5645,7 +5878,7 @@ N=$((N+1))
 
 NAME=OPENSSLTCP6_LOWPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%openssl%*|*%lowport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%openssl%*|*%lowport%*|*%$NAME%*)
 TEST="$NAME: security of SSL-L over TCP/IPv6 with LOWPORT option"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -5655,8 +5888,8 @@ elif ! feat=$(testaddrs tcp ip6) || ! runsip6 >/dev/null; then
     $PRINTF "test $F_n $TEST... ${YELLOW}TCP6 not available${NORMAL}\n" $N
     numCANT=$((numCANT+1))
 else
-gentestcert testsrv
-testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip6,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "lowport" "ssl:[::1]:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 6 tcp $PORT -1
+gentestcert6 testsrv6
+testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip6,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv6.crt,key=testsrv6.key" "" "lowport" "ssl:[::1]:$PORT,cafile=testsrv6.crt,$SOCAT_EGD" 6 tcp $PORT -1
 fi ;; # NUMCOND, feats
 esac
 PORT=$((PORT+1))
@@ -5664,20 +5897,68 @@ N=$((N+1))
 
 NAME=OPENSSLTCP6_TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%openssl%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%openssl%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of SSL-L over TCP/IPv6 with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip6 tcp libwrap openssl) || ! runsip6 >/dev/null; then
     $PRINTF "test $F_n $TEST... ${YELLOW}$feat not available${NORMAL}\n" $N
     numCANT=$((numCANT+1))
 else
-gentestcert testsrv
+gentestcert6 testsrv6
 ha="$td/hosts.allow"
 hd="$td/hosts.deny"
 $ECHO "socat: [::2]" >"$ha"
 $ECHO "ALL: ALL" >"$hd"
-testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip6,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv.crt,key=testsrv.key" "" "tcpwrap-etc=$td" "ssl:[::1]:$PORT,cafile=testsrv.crt,$SOCAT_EGD" 6 tcp $PORT -1
+testserversec "$N" "$TEST" "$opts -s" "ssl-l:$PORT,pf=ip6,reuseaddr,fork,retry=1,$SOCAT_EGD,verify=0,cert=testsrv6.crt,key=testsrv6.key" "" "tcpwrap-etc=$td" "ssl:[::1]:$PORT,cafile=testsrv6.crt,$SOCAT_EGD" 6 tcp $PORT -1
 fi ;; # NUMCOND, feats
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+
+
+# test security with the openssl-commonname option on client side
+NAME=OPENSSL_CN_CLIENT_SECURITY
+case "$TESTS" in
+*%$N%*|*%functions%*|*%security%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+TEST="$NAME: security of client openssl-commonname option"
+# connect using non matching server name/address with commonname
+# options, this should succeed. Then without this option, should fail
+if ! eval $NUMCOND; then :;
+elif ! testaddrs openssl >/dev/null; then
+    $PRINTF "test $F_n $TEST... ${YELLOW}OPENSSL not available${NORMAL}\n" $N
+    numCANT=$((numCANT+1))
+elif ! testaddrs listen tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
+    $PRINTF "test $F_n $TEST... ${YELLOW}TCP/IPv4 not available${NORMAL}\n" $N
+    numCANT=$((numCANT+1))
+else
+gentestcert testsrv
+gentestcert testcli
+testserversec "$N" "$TEST" "$opts" "SSL:127.0.0.1:$PORT,fork,retry=2,verify,cafile=testsrv.crt" "commonname=$LOCALHOST" "" "SSL-L:$PORT,pf=ip4,reuseaddr,cert=testsrv.crt,key=testsrv.key,verify=0" 4 tcp "" 0
+fi ;; # testaddrs, NUMCOND
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+
+# test security with the openssl-commonname option on server side
+NAME=OPENSSL_CN_SERVER_SECURITY
+case "$TESTS" in
+*%$N%*|*%functions%*|*%security%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+TEST="$NAME: security of server openssl-commonname option"
+# connect using with client certificate to server, this should succeed.
+# Then use the server with a non matching openssl-commonname option,
+# this must fail
+if ! eval $NUMCOND; then :;
+elif ! testaddrs openssl >/dev/null; then
+    $PRINTF "test $F_n $TEST... ${YELLOW}OPENSSL not available${NORMAL}\n" $N
+    numCANT=$((numCANT+1))
+elif ! testaddrs listen tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
+    $PRINTF "test $F_n $TEST... ${YELLOW}TCP/IPv4 not available${NORMAL}\n" $N
+    numCANT=$((numCANT+1))
+else
+gentestcert testsrv
+gentestcert testcli
+testserversec "$N" "$TEST" "$opts" "SSL-L:$PORT,pf=ip4,reuseaddr,cert=testsrv.crt,key=testsrv.key,cafile=testcli.crt" "" "commonname=onlyyou" "SSL:$LOCALHOST:$PORT,verify=0,cafile=testsrv.crt,cert=testcli.crt,key=testcli.key" 4 tcp "" 0
+fi ;; # testaddrs, NUMCOND
 esac
 PORT=$((PORT+1))
 N=$((N+1))
@@ -5685,7 +5966,7 @@ N=$((N+1))
 
 NAME=OPENSSL_FIPS_SECURITY
 case "$TESTS" in
-*%functions%*|*%security%*|*%openssl%*|*%fips%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%openssl%*|*%fips%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: OpenSSL restrictions by FIPS"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -5710,7 +5991,7 @@ N=$((N+1))
 
 NAME=UNIEXECEOF
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: give exec'd write-only process a chance to flush (-u)"
 testod "$N" "$TEST" "" exec:"$OD_C" "$opts -u"
 esac
@@ -5719,7 +6000,7 @@ N=$((N+1))
 
 NAME=REVEXECEOF
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: give exec'd write-only process a chance to flush (-U)"
 testod "$N" "$TEST" exec:"$OD_C" "-" "$opts -U"
 esac
@@ -5728,7 +6009,7 @@ N=$((N+1))
 
 NAME=FILANDIR
 case "$TESTS" in
-*%filan%*|*%$NAME%*)
+*%$N%*|*%filan%*|*%$NAME%*)
 TEST="$NAME: check type printed for directories"
 if ! eval $NUMCOND; then :; else
 te="$td/test$N.stderr"
@@ -5741,6 +6022,7 @@ else
     $PRINTF "$FAILED\n"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi ;; # NUMCOND
 esac
@@ -5749,14 +6031,14 @@ N=$((N+1))
 
 NAME=FILANSOCKET
 case "$TESTS" in
-*%filan%*|*%$NAME%*)
+*%$N%*|*%filan%*|*%$NAME%*)
 TEST="$NAME: capability to analyze named unix socket"
 if ! eval $NUMCOND; then :; else
 ts="$td/test$N.socket"
 te1="$td/test$N.stderr1"	# socat
 te2="$td/test$N.stderr2"	# filan
 printf "test $F_n $TEST... " $N
-$SOCAT unix-l:"$ts" /dev/null </dev/null 2>"$te1" &
+$TRACE $SOCAT $opts UNIX-LISTEN:"$ts" /dev/null </dev/null 2>"$te1" &
 spid=$!
 waitfile "$ts" 1
 type=$($FILAN -f "$ts" 2>$te2 |tail -n 1 |awk '{print($2);}')
@@ -5768,6 +6050,7 @@ else
     cat "$te1"
     cat "$te2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 kill $spid 2>/dev/null
 wait
@@ -5793,17 +6076,17 @@ testptywaitslave () {
     local da="test$N $(date) $RANDOM"
 printf "test $F_n $TEST... " $N
 # first generate a pty, then a socket
-($SOCAT $opts -lpsocat1 pty,$PTYTYPE,pty-wait-slave,link="$tp" unix-listen:"$ts" 2>"$te1"; rm -f "$tp") 2>/dev/null &
+($TRACE $SOCAT $opts -lpsocat1 pty,$PTYTYPE,pty-wait-slave,link="$tp" unix-listen:"$ts" 2>"$te1"; rm -f "$tp") 2>/dev/null &
 pid=$!
 waitfile "$tp"
 # if pty was non-blocking, the socket is active, and socat1 will term
-$SOCAT $opts -T 10 -lpsocat2 file:/dev/null unix-connect:"$ts" 2>"$te2"
+$TRACE $SOCAT $opts -T 10 -lpsocat2 file:/dev/null unix-connect:"$ts" 2>"$te2"
 # if pty is blocking, first socat is still active and we get a connection now
-#((echo "$da"; sleep 2) |$SOCAT -lpsocat3 $opts - file:"$tp",$PTYOPTS2 >"$tf" 2>"$te3") &
-( (waitfile "$ts"; echo "$da"; sleep 1) |$SOCAT -lpsocat3 $opts - file:"$tp",$PTYOPTS2 >"$tf" 2>"$te3") &
+#((echo "$da"; sleep 2) |$TRACE $SOCAT -lpsocat3 $opts - file:"$tp",$PTYOPTS2 >"$tf" 2>"$te3") &
+( (waitfile "$ts"; echo "$da"; sleep 1) |$TRACE $SOCAT -lpsocat3 $opts - file:"$tp",$PTYOPTS2 >"$tf" 2>"$te3") &
 waitfile "$ts"
 # but we need an echoer on the socket
-$SOCAT $opts -lpsocat4 unix:"$ts" echo 2>"$te4"
+$TRACE $SOCAT $opts -lpsocat4 unix:"$ts" echo 2>"$te4"
 # now $tf file should contain $da
 #kill $pid 2>/dev/null
 wait
@@ -5825,7 +6108,7 @@ fi
 NAME=PTMXWAITSLAVE
 PTYTYPE=ptmx
 case "$TESTS" in
-*%functions%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: test if master pty ($PTYTYPE) waits for slave connection"
 if ! eval $NUMCOND; then :; else
 if ! feat=$(testaddrs pty); then
@@ -5844,7 +6127,7 @@ N=$((N+1))
 NAME=OPENPTYWAITSLAVE
 PTYTYPE=openpty
 case "$TESTS" in
-*%functions%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: test if master pty ($PTYTYPE) waits for slave connection"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs pty); then
@@ -5862,7 +6145,7 @@ N=$((N+1))
 
 NAME=CONNECTTIMEOUT
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%timeout%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%timeout%*|*%$NAME%*)
 TEST="$NAME: test the connect-timeout option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp); then
@@ -5883,8 +6166,8 @@ te2="$td/test$N.stderr2"
 tk2="$td/test$N.kill2"
 $PRINTF "test $F_n $TEST... " $N
 # first, try to make socat hang and see if it can be killed
-#$SOCAT $opts - tcp:$HANGIP:1 >"$te1" 2>&1 </dev/null &
-CMD="$SOCAT $opts - tcp:$HANGIP:1"
+#$TRACE $SOCAT $opts - tcp:$HANGIP:1 >"$te1" 2>&1 </dev/null &
+CMD="$TRACE $SOCAT $opts - tcp:$HANGIP:1"
 $CMD >"$te1" 2>&1 </dev/null &
 pid1=$!
 sleep 2
@@ -5893,7 +6176,7 @@ if ! kill $pid1 2>"$tk1"; then
     numCANT=$((numCANT+1))
 else
 # second, set connect-timeout and see if socat exits before kill
-$SOCAT $opts - tcp:$HANGIP:1,connect-timeout=1.0 >"$te2" 2>&1 </dev/null &
+$TRACE $SOCAT $opts - tcp:$HANGIP:1,connect-timeout=1.0 >"$te2" 2>&1 </dev/null &
 pid2=$!
 sleep 2
 if kill $pid2 2>"$tk2"; then
@@ -5902,6 +6185,7 @@ if kill $pid2 2>"$tk2"; then
     cat "$te1"
     cat "$te2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
    numOK=$((numOK+1))
@@ -5919,7 +6203,7 @@ N=$((N+1))
 NAME=CONNECTTIMEOUT_CONN
 if ! eval $NUMCOND; then :; else
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%timeout%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%timeout%*|*%$NAME%*)
 TEST="$NAME: TCP4 connect-timeout option when server replies"
 # just try a connection that is expected to succeed with the usual data
 # transfer; with the bug it will fail
@@ -5929,24 +6213,26 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP4-LISTEN:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts STDIO TCP4:$ts,connect-timeout=1"
+CMD1="$TRACE $SOCAT $opts TCP4-LISTEN:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts STDIO TCP4:$ts,connect-timeout=1"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1=$!
 waittcp4port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    cat "${te}1"
    echo "$CMD2"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -5962,7 +6248,7 @@ N=$((N+1))
 
 NAME=OPENSSLLISTENDSA
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%$NAME%*)
 TEST="$NAME: openssl listen with DSA certificate"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -5975,8 +6261,8 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD2="$SOCAT $opts OPENSSL-LISTEN:$PORT,pf=ip4,reuseaddr,$SOCAT_EGD,cert=$SRVCERT.pem,key=$SRVCERT.key,verify=0 pipe"
-CMD="$SOCAT $opts - openssl:$LOCALHOST:$PORT,pf=ip4,verify=0,$SOCAT_EGD"
+CMD2="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,pf=ip4,reuseaddr,$SOCAT_EGD,cert=$SRVCERT.pem,key=$SRVCERT.key,verify=0 pipe"
+CMD="$TRACE $SOCAT $opts - openssl:$LOCALHOST:$PORT,pf=ip4,verify=0,$SOCAT_EGD"
 $PRINTF "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
@@ -5990,6 +6276,7 @@ if ! echo "$da" |diff - "$tf" >"$tdiff"; then
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat ${te}1 ${te}2; fi
@@ -6024,7 +6311,7 @@ signum () {
 for signam in TERM ILL; do
 NAME=EXITCODESIG$signam
 case "$TESTS" in
-*%functions%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pty%*|*%signal%*|*%$NAME%*)
 TEST="$NAME: exit status when dying on SIG$signam"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs pty); then
@@ -6038,7 +6325,7 @@ tp="$td/test$N.pid"
 $PRINTF "test $F_n $TEST... " $N
 (sleep 1; kill -"$SIG" "$(cat "$tpp")") &
 # a simple "system:echo $PPID..." does not work on NetBSD, OpenBSD
-#$SOCAT $opts echo system:'exec /bin/bash -c "echo \$PPID '">$tpp"'; echo \$$ '">$tp; read x\"",nofork 2>"$te"; stat=$?
+#$TRACE $SOCAT $opts echo SYSTEM:'exec /bin/bash -c "echo \$PPID '">$tpp"'; echo \$$ '">$tp; read x\"",nofork 2>"$te"; stat=$?
 tsh="$td/test$N.sh"
 cat <<EOF >"$tsh"
 #! /bin/bash
@@ -6047,7 +6334,10 @@ echo \$\$ >"$tp"
 read x
 EOF
 chmod a+x "$tsh"
-$SOCAT $opts echo system:"exec \"$tsh\"",pty,setsid,nofork 2>"$te"; stat=$?
+#$TRACE $SOCAT $opts echo SYSTEM:"exec \"$tsh\"",pty,setsid,nofork 2>"$te"; stat=$?
+CMD="$TRACE $SOCAT $opts ECHO SYSTEM:\"exec\\\ \\\"$tsh\\\"\",pty,setsid,nofork"
+$TRACE $SOCAT $opts ECHO SYSTEM:"exec \"$tsh\"",pty,setsid,nofork 2>"$te"
+stat=$?
 sleep 1; kill -INT $(cat $tp)
 wait
 if [ "$stat" -eq $((128+$SIG)) ]; then
@@ -6055,8 +6345,10 @@ if [ "$stat" -eq $((128+$SIG)) ]; then
    numOK=$((numOK+1))
 else
     $PRINTF "$FAILED\n"
+    echo "$CMD"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 wait
 fi ;; # NUMCOND, feats
@@ -6068,7 +6360,7 @@ done
 NAME=READBYTES
 #set -vx
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: restrict reading from file with bytes option"
 if ! eval $NUMCOND; then :;
 elif false; then
@@ -6082,7 +6374,7 @@ te="$td/test$N.err"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
 # the feature that we really want to test is in the readline.sh script:
-CMD="$SOCAT $opts -u open:$ti,readbytes=100 -"
+CMD="$TRACE $SOCAT $opts -u open:$ti,readbytes=100 -"
 printf "test $F_n $TEST... " $N
 rm -f "$tf" "$ti" "$to"
 #
@@ -6093,11 +6385,12 @@ AAAAAAAAAAAAAAAAAAAAAAAA" >"$tr"	# 100 bytes
 cat "$tr" "$tr" >"$ti"			# 200 bytes
 $CMD >"$to" 2>"$te"
 if ! diff "$tr" "$to" >"$tdiff" 2>&1; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD"
     cat "$te"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -6110,7 +6403,7 @@ N=$((N+1))
 
 NAME=UDPLISTENFORK
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%udp%*|*%listen%*|*%fork%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%udp%*|*%listen%*|*%fork%*|*%$NAME%*)
 TEST="$NAME: UDP socket rebinds after first connection"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
@@ -6120,9 +6413,9 @@ da1="test$N $(date) $RANDOM"
 da2="test$N $(date) $RANDOM"
 #establish a listening and forking udp socket in background
 #processes hang forever without -T
-SRV="$SOCAT -T 5 $opts -lpserver UDP4-LISTEN:$PORT,bind=$LOCALHOST,fork PIPE"
+SRV="$TRACE $SOCAT -T 5 $opts -lpserver UDP4-LISTEN:$PORT,bind=$LOCALHOST,fork PIPE"
 #make a first and a second connection
-CLI="$SOCAT $opts -lpclient - UDP4-CONNECT:$LOCALHOST:$PORT"
+CLI="$TRACE $SOCAT $opts -lpclient - UDP4-CONNECT:$LOCALHOST:$PORT"
 $PRINTF "test $F_n $TEST... " $N
 eval "$SRV 2>${te}s &"
 pids=$!
@@ -6150,10 +6443,12 @@ if [ $rc -ne 0 ]; then
     echo "$CLI"
     cat "${te}s" "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da2" |diff - "${tf}2" >"$tdiff"; then
     $PRINTF "$FAILED: diff\n"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -6174,7 +6469,7 @@ protov="$(echo "$PROTOV" |tr A-Z a-z)"
 proto="${protov%%[0-9]}"
 NAME=${PROTOV}LISTENFORK
 case "$TESTS" in
-*%functions%*|*%$protov%*|*%$proto%*|*%listen%*|*%fork%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$protov%*|*%$proto%*|*%listen%*|*%fork%*|*%$NAME%*)
 TEST="$NAME: $PROTOV listen handles 2 concurrent connections"
 # have a listening address with fork option. connect with client1, send a piece
 # of data, wait 1s, connect with client2, send another piece of data, wait 1s,
@@ -6215,9 +6510,9 @@ esac
 echo -e "$da1a\n$da2\n$da1b" >"$tref"
 # establish a listening and forking listen socket in background
 # UDP processes hang forever without -T
-CMD0="$SOCAT -T 5 $opts -lpserver $PROTOV-LISTEN:$tla,fork PIPE"
+CMD0="$TRACE $SOCAT -T 5 $opts -lpserver $PROTOV-LISTEN:$tla,fork PIPE"
 # make a first and a second connection
-CMD1="$SOCAT $opts -lpclient - $PROTOV-CONNECT:$tca"
+CMD1="$TRACE $SOCAT $opts -lpclient - $PROTOV-CONNECT:$tca"
 $PRINTF "test $F_n $TEST... " $N
 eval "$CMD0 2>${te}0 &"
 pid0=$!
@@ -6234,6 +6529,7 @@ if ! diff "$tref" "$tf" >"$tdiff"; then
     cat "${te}0" "${te}1" "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -6252,12 +6548,11 @@ SCTP4 $LOCALHOST PORT
 SCTP6 $LOCALHOST6 PORT
 UNIX FILE ,
 "
-set +vx
 
 
 NAME=UNIXTOSTREAM
 case "$TESTS" in
-*%functions%*|*%unix%*|*%listen%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%unix%*|*%listen%*|*%$NAME%*)
 TEST="$NAME: generic UNIX client connects to stream socket"
 if ! eval $NUMCOND; then :; else
 ts="$td/test$N.socket"
@@ -6266,9 +6561,9 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da1="test$N $(date) $RANDOM"
 #establish a listening unix socket in background
-SRV="$SOCAT $opts -lpserver UNIX-LISTEN:\"$ts\" PIPE"
+SRV="$TRACE $SOCAT $opts -lpserver UNIX-LISTEN:\"$ts\" PIPE"
 #make a connection
-CLI="$SOCAT $opts -lpclient - UNIX:\"$ts\""
+CLI="$TRACE $SOCAT $opts -lpclient - UNIX:\"$ts\""
 $PRINTF "test $F_n $TEST... " $N
 eval "$SRV 2>${te}s &"
 pids=$!
@@ -6281,11 +6576,13 @@ if [ $? -ne 0 ]; then
     echo "$CLI"
     cat "${te}s" "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da1" |diff - "${tf}1" >"$tdiff"; then
     kill "$pids" 2>/dev/null
     $PRINTF "$FAILED; diff:\n"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -6298,7 +6595,7 @@ N=$((N+1))
 
 NAME=UNIXTODGRAM
 case "$TESTS" in
-*%functions%*|*%engine%*|*%unix%*|*%recv%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%unix%*|*%recv%*|*%$NAME%*)
 TEST="$NAME: generic UNIX client connects to datagram socket"
 if ! eval $NUMCOND; then :; else
 ts1="$td/test$N.socket1"
@@ -6308,10 +6605,10 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da1="test$N $(date) $RANDOM"
 #establish a receiving unix datagram socket in background
-SRV="$SOCAT $opts -lpserver UNIX-RECVFROM:\"$ts1\" PIPE"
+SRV="$TRACE $SOCAT $opts -lpserver UNIX-RECVFROM:\"$ts1\" PIPE"
 #make a connection
-CLI="$SOCAT $opts -lpclient - UNIX:\"$ts1\",bind=\"$ts2\""
-#CLI="$SOCAT $opts -lpclient - UNIX:\"$ts1\""
+CLI="$TRACE $SOCAT $opts -lpclient - UNIX:\"$ts1\",bind=\"$ts2\""
+#CLI="$TRACE $SOCAT $opts -lpclient - UNIX:\"$ts1\""
 $PRINTF "test $F_n $TEST... " $N
 eval "$SRV 2>${te}s &"
 pids=$!
@@ -6327,6 +6624,7 @@ if [ $rc -ne 0 ]; then
     echo "$CLI"
     cat "${te}1" "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da1" |diff - "${tf}1" >"$tdiff"; then
     kill "$pids" 2>/dev/null
     $PRINTF "$FAILED:\n"
@@ -6336,6 +6634,7 @@ elif ! echo "$da1" |diff - "${tf}1" >"$tdiff"; then
     cat "${te}1"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -6348,7 +6647,7 @@ N=$((N+1))
 # there was an error in address EXEC with options pipes,stderr
 NAME=EXECPIPESSTDERR
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: simple echo via exec of cat with pipes,stderr"
 # this test is known to fail when logging is enabled with OPTS/opts env var.
 SAVE_opts="$opts"
@@ -6361,7 +6660,7 @@ N=$((N+1))
 # EXEC and SYSTEM with stderr injected socat messages into the data stream. 
 NAME=EXECSTDERRLOG
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: simple echo via exec of cat with pipes,stderr"
 SAVE_opts="$opts"
 # make sure at least two -d are there
@@ -6378,7 +6677,7 @@ N=$((N+1))
 
 NAME=SIMPLEPARSE
 case "$TESTS" in
-*%functions%*|*%PARSE%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%PARSE%*|*%$NAME%*)
 TEST="$NAME: invoke socat from socat"
 testecho "$N" "$TEST" "" exec:"$SOCAT - exec\:$CAT,pipes" "$opts"
 esac
@@ -6387,7 +6686,7 @@ N=$((N+1))
 
 NAME=FULLPARSE
 case "$TESTS" in
-*%functions%*|*%parse%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%parse%*|*%$NAME%*)
 TEST="$NAME: correctly parse special chars"
 if ! eval $NUMCOND; then :; else
 $PRINTF "test $F_n $TEST... " $N
@@ -6398,20 +6697,22 @@ tdiff="$td/test$N.diff"
 # if they are scanned incorrectly, socat will see an "unknown option"
 dain='(,)[,]{,}","([),])hugo'
 daout='(,)[,]{,},([),])hugo'
-"$SOCAT" $opts -u "exec:echo $dain" - >"$tf" 2>"$te"
+$TRACE "$SOCAT" $opts -u "exec:echo $dain" - >"$tf" 2>"$te"
 rc=$?
 echo "$daout" |diff "$tf" - >"$tdiff"
 if [ "$rc" -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
-    echo "$SOCAT" -u "exec:echo $da" -
+    $PRINTF "$FAILED:\n"
+    echo "$TRACE $SOCAT" -u "exec:echo $da" -
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif [ -s "$tdiff" ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED:\n"
     echo diff:
     cat "$tdiff"
     if [ -n "$debug" ]; then cat $te; fi
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat $te; fi
@@ -6423,7 +6724,7 @@ N=$((N+1))
 
 NAME=NESTEDSOCATEXEC
 case "$TESTS" in
-*%parse%*|*%functions%*|*%$NAME%*)
+*%parse%*|*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: does lexical analysis work sensibly (exec)"
 testecho "$N" "$TEST" "" "exec:'$SOCAT - exec:$CAT,pipes'" "$opts" 1
 esac
@@ -6431,7 +6732,7 @@ N=$((N+1))
 
 NAME=NESTEDSOCATSYSTEM
 case "$TESTS" in
-*%parse%*|*%functions%*|*%$NAME%*)
+*%parse%*|*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: does lexical analysis work sensibly (system)"
 testecho "$N" "$TEST" "" "system:\"$SOCAT - exec:$CAT,pipes\"" "$opts" 1
 esac
@@ -6440,7 +6741,7 @@ N=$((N+1))
 
 NAME=TCP6BYTCP4
 case "$TESTS" in
-*%functions%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%$NAME%*)
 TEST="$NAME: TCP4 mapped into TCP6 address space"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip6 >/dev/null || ! runsip6 >/dev/null; then
@@ -6453,24 +6754,26 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP6-listen:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP6:$ts"
+CMD1="$TRACE $SOCAT $opts TCP6-listen:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP6:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
 waittcp6port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -6486,7 +6789,7 @@ N=$((N+1))
 # test the UDP4-SENDTO and UDP4-RECVFROM addresses together
 NAME=UDP4DGRAM
 case "$TESTS" in
-*%functions%*|*%udp%*|*%udp4%*|*%ip4%*|*%dgram%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%udp%*|*%udp4%*|*%ip4%*|*%dgram%*|*%$NAME%*)
 TEST="$NAME: UDP/IPv4 sendto and recvfrom"
 # start a UDP4-RECVFROM process that echoes data, and send test data using
 # UDP4-SENDTO. The sent data should be returned.
@@ -6500,8 +6803,8 @@ ts1="$ts1a:$ts1p"
 ts2p=$PORT; PORT=$((PORT+1))
 ts2="127.0.0.1:$ts2p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts UDP4-RECVFROM:$ts1p,reuseaddr,bind=$ts1a PIPE"
-CMD2="$SOCAT $opts - UDP4-SENDTO:$ts1,bind=$ts2"
+CMD1="$TRACE $SOCAT $opts UDP4-RECVFROM:$ts1p,reuseaddr,bind=$ts1a PIPE"
+CMD2="$TRACE $SOCAT $opts - UDP4-SENDTO:$ts1,bind=$ts2"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 pid1="$!"
@@ -6510,12 +6813,13 @@ echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 rc2="$?"
 kill "$pid1" 2>/dev/null; wait;
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    cat "${te}1"
    echo "$CMD2"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
@@ -6524,6 +6828,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    echo "$CMD2"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -6538,7 +6843,7 @@ N=$((N+1))
 
 NAME=UDP6DGRAM
 case "$TESTS" in
-*%functions%*|*%udp%*|*%udp6%*|*%ip6%*|*%dgram%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%udp%*|*%udp6%*|*%ip6%*|*%dgram%*|*%$NAME%*)
 TEST="$NAME: UDP/IPv6 datagram"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip6) || ! runsip6 >/dev/null; then
@@ -6554,23 +6859,25 @@ ts1="$tsa:$ts1p"
 ts2p=$PORT; PORT=$((PORT+1))
 ts2="$tsa:$ts2p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts UDP6-RECVFROM:$ts1p,reuseaddr,bind=$tsa PIPE"
-CMD2="$SOCAT $opts - UDP6-SENDTO:$ts1,bind=$ts2"
+CMD1="$TRACE $SOCAT $opts UDP6-RECVFROM:$ts1p,reuseaddr,bind=$tsa PIPE"
+CMD2="$TRACE $SOCAT $opts - UDP6-SENDTO:$ts1,bind=$ts2"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 waitudp6port $ts1p 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat ${te}1 ${te}2; fi
@@ -6584,7 +6891,7 @@ N=$((N+1))
 
 NAME=RAWIP4RECVFROM
 case "$TESTS" in
-*%functions%*|*%ip%*|*%ip4%*|*%rawip%*|*%rawip4%*|*%dgram%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip%*|*%ip4%*|*%rawip%*|*%rawip4%*|*%dgram%*|*%root%*|*%$NAME%*)
 TEST="$NAME: raw IPv4 datagram"
 if ! eval $NUMCOND; then :;
 elif [ $(id -u) -ne 0 -a "$withroot" -eq 0 ]; then
@@ -6600,8 +6907,8 @@ ts1="$ts1a:$ts1p"
 ts2a="$SECONDADDR"
 ts2="$ts2a:$ts2p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts IP4-RECVFROM:$ts1p,reuseaddr,bind=$ts1a PIPE"
-CMD2="$SOCAT $opts - IP4-SENDTO:$ts1,bind=$ts2a"
+CMD1="$TRACE $SOCAT $opts IP4-RECVFROM:$ts1p,reuseaddr,bind=$ts1a PIPE"
+CMD2="$TRACE $SOCAT $opts - IP4-SENDTO:$ts1,bind=$ts2a"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 pid1=$!
@@ -6610,16 +6917,18 @@ echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 rc2=$?
 kill $pid1 2>/dev/null;  wait
 if [ $rc2 -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -6633,7 +6942,7 @@ N=$((N+1))
 if false; then
 NAME=RAWIP6RECVFROM
 case "$TESTS" in
-*%functions%*|*%ip%*|*%ip6%*|*%rawip%*|*%rawip6%*|*%dgram%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip%*|*%ip6%*|*%rawip%*|*%rawip6%*|*%dgram%*|*%root%*|*%$NAME%*)
 TEST="$NAME: raw IPv6 datagram by self addressing"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip6 rawip) || ! runsip6 >/dev/null; then
@@ -6651,23 +6960,25 @@ tsa="[::1]"
 ts1="$tsa:$ts1p"
 ts2="$tsa"
 da="test$N $(date) $RANDOM"
-#CMD1="$SOCAT $opts IP6-RECVFROM:$ts1p,reuseaddr,bind=$tsa PIPE"
-CMD2="$SOCAT $opts - IP6-SENDTO:$ts1,bind=$ts2"
+#CMD1="$TRACE $SOCAT $opts IP6-RECVFROM:$ts1p,reuseaddr,bind=$tsa PIPE"
+CMD2="$TRACE $SOCAT $opts - IP6-SENDTO:$ts1,bind=$ts2"
 printf "test $F_n $TEST... " $N
 #$CMD1 2>"${te}1" &
 waitip6proto $ts1p 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
 #   echo "$CMD1 &"
 #   cat "${te}1"
    echo "$CMD2"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "$te"; fi
@@ -6681,7 +6992,7 @@ fi #false
 
 NAME=UNIXDGRAM
 case "$TESTS" in
-*%functions%*|*%engine%*|*%unix%*|*%dgram%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%unix%*|*%dgram%*|*%$NAME%*)
 TEST="$NAME: UNIX datagram"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
@@ -6690,8 +7001,8 @@ tdiff="$td/test$N.diff"
 ts1="$td/test$N.socket1"
 ts2="$td/test$N.socket2"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts UNIX-RECVFROM:$ts1,reuseaddr PIPE"
-CMD2="$SOCAT $opts - UNIX-SENDTO:$ts1,bind=$ts2"
+CMD1="$TRACE $SOCAT $opts UNIX-RECVFROM:$ts1,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts - UNIX-SENDTO:$ts1,bind=$ts2"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 pid1="$!"
@@ -6700,16 +7011,18 @@ echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 rc2=$?
 kill "$pid1" 2>/dev/null; wait
 if [ $rc2 -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    cat "${te}1"
    echo "$CMD2"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -6723,7 +7036,7 @@ N=$((N+1))
 
 NAME=UDP4RECV
 case "$TESTS" in
-*%functions%*|*%engine%*|*%ip4%*|*%dgram%*|*%udp%*|*%udp4%*|*%recv%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%ip4%*|*%dgram%*|*%udp%*|*%udp4%*|*%recv%*|*%$NAME%*)
 TEST="$NAME: UDP/IPv4 receive"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
@@ -6733,8 +7046,8 @@ ts1p=$PORT; PORT=$((PORT+1))
 ts1a="127.0.0.1"
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -u UDP4-RECV:$ts1p,reuseaddr -"
-CMD2="$SOCAT $opts -u - UDP4-SENDTO:$ts1"
+CMD1="$TRACE $SOCAT $opts -u UDP4-RECV:$ts1p,reuseaddr -"
+CMD2="$TRACE $SOCAT $opts -u - UDP4-SENDTO:$ts1"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1="$!"
@@ -6745,12 +7058,13 @@ rc2="$?"
 i=0; while [ ! -s "$tf" -a "$i" -lt 10 ]; do  usleep 100000; i=$((i+1));  done
 kill "$pid1" 2>/dev/null; wait
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
@@ -6759,6 +7073,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -6772,7 +7087,7 @@ N=$((N+1))
 
 NAME=UDP6RECV
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%dgram%*|*%udp%*|*%udp6%*|*%recv%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%dgram%*|*%udp%*|*%udp6%*|*%recv%*|*%$NAME%*)
 TEST="$NAME: UDP/IPv6 receive"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip6) || ! runsip6 >/dev/null; then
@@ -6786,8 +7101,8 @@ ts1p=$PORT; PORT=$((PORT+1))
 ts1a="[::1]"
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -u UDP6-RECV:$ts1p,reuseaddr -"
-CMD2="$SOCAT $opts -u - UDP6-SENDTO:$ts1"
+CMD1="$TRACE $SOCAT $opts -u UDP6-RECV:$ts1p,reuseaddr -"
+CMD2="$TRACE $SOCAT $opts -u - UDP6-SENDTO:$ts1"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1="$!"
@@ -6798,16 +7113,18 @@ rc2="$?"
 i=0; while [ ! -s "$tf" -a "$i" -lt 10 ]; do  usleep 100000; i=$((i+1));  done
 kill "$pid1" 2>/dev/null; wait
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -6820,7 +7137,7 @@ N=$((N+1))
 
 NAME=RAWIP4RECV
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%dgram%*|*%rawip%*|*%rawip4%*|*%recv%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%dgram%*|*%rawip%*|*%rawip4%*|*%recv%*|*%root%*|*%$NAME%*)
 TEST="$NAME: raw IPv4 receive"
 if ! eval $NUMCOND; then :;
 elif [ $(id -u) -ne 0 -a "$withroot" -eq 0 ]; then
@@ -6834,8 +7151,8 @@ ts1p=$PROTO; PROTO=$((PROTO+1))
 ts1a="127.0.0.1"
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -u IP4-RECV:$ts1p,reuseaddr -"
-CMD2="$SOCAT $opts -u - IP4-SENDTO:$ts1"
+CMD1="$TRACE $SOCAT $opts -u IP4-RECV:$ts1p,reuseaddr -"
+CMD2="$TRACE $SOCAT $opts -u - IP4-SENDTO:$ts1"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1="$!"
@@ -6846,16 +7163,18 @@ rc2="$?"
 i=0; while [ ! -s "$tf" -a "$i" -lt 10 ]; do  usleep 100000; i=$((i+1));  done
 kill "$pid1" 2>/dev/null; wait
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -6868,7 +7187,7 @@ N=$((N+1))
 
 NAME=RAWIP6RECV
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%dgram%*|*%rawip%*|*%rawip6%*|*%recv%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%dgram%*|*%rawip%*|*%rawip6%*|*%recv%*|*%root%*|*%$NAME%*)
 TEST="$NAME: raw IPv6 receive"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip6 rawip) || ! runsip6 >/dev/null; then
@@ -6885,8 +7204,8 @@ ts1p=$PROTO; PROTO=$((PROTO+1))
 ts1a="[::1]"
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -u IP6-RECV:$ts1p,reuseaddr -"
-CMD2="$SOCAT $opts -u - IP6-SENDTO:$ts1"
+CMD1="$TRACE $SOCAT $opts -u IP6-RECV:$ts1p,reuseaddr -"
+CMD2="$TRACE $SOCAT $opts -u - IP6-SENDTO:$ts1"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1="$!"
@@ -6896,16 +7215,18 @@ rc2="$?"
 i=0; while [ ! -s "$tf" -a "$i" -lt 10 ]; do  usleep 100000; i=$((i+1));  done
 kill "$pid1" 2>/dev/null; wait
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -6918,7 +7239,7 @@ N=$((N+1))
 
 NAME=UNIXRECV
 case "$TESTS" in
-*%functions%*|*%unix%*|*%dgram%*|*%recv%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%unix%*|*%dgram%*|*%recv%*|*%$NAME%*)
 TEST="$NAME: UNIX receive"
 if ! eval $NUMCOND; then :; else
 ts="$td/test$N.socket"
@@ -6927,8 +7248,8 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 ts1="$ts"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -u UNIX-RECV:$ts1,reuseaddr -"
-CMD2="$SOCAT $opts -u - UNIX-SENDTO:$ts1"
+CMD1="$TRACE $SOCAT $opts -u UNIX-RECV:$ts1,reuseaddr -"
+CMD2="$TRACE $SOCAT $opts -u - UNIX-SENDTO:$ts1"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1="$!"
@@ -6938,16 +7259,18 @@ rc2="$?"
 i=0; while [ ! -s "$tf" -a "$i" -lt 10 ]; do  usleep 100000; i=$((i+1));  done
 kill "$pid1" 2>/dev/null; wait
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -6961,7 +7284,7 @@ N=$((N+1))
 
 NAME=UDP4RECVFROM_SOURCEPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%sourceport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%sourceport%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-RECVFROM with SOURCEPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip4) || ! runsip4 >/dev/null; then
@@ -6976,7 +7299,7 @@ N=$((N+1))
 
 NAME=UDP4RECVFROM_LOWPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%lowport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%lowport%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-RECVFROM with LOWPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip4) || ! runsip4 >/dev/null; then
@@ -6991,7 +7314,7 @@ N=$((N+1))
 
 NAME=UDP4RECVFROM_RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-RECVFROM with RANGE option"
 #testserversec "$N" "$TEST" "$opts -s" "udp4-recvfrom:$PORT,reuseaddr,fork" "" "range=$SECONDADDR/32" "udp4-sendto:127.0.0.1:$PORT" 4 udp $PORT 0
 if ! eval $NUMCOND; then :; else
@@ -7003,7 +7326,7 @@ N=$((N+1))
 
 NAME=UDP4RECVFROM_TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-RECVFROM with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4 udp libwrap) || ! runsip4 >/dev/null; then
@@ -7024,7 +7347,7 @@ N=$((N+1))
 
 NAME=UDP4RECV_SOURCEPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%sourceport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%sourceport%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-RECV with SOURCEPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip4) || ! runsip4 >/dev/null; then
@@ -7044,7 +7367,7 @@ N=$((N+1))
 
 NAME=UDP4RECV_LOWPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%lowport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%lowport%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-RECV with LOWPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip4) || ! runsip4 >/dev/null; then
@@ -7063,7 +7386,7 @@ N=$((N+1))
 
 NAME=UDP4RECV_RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-RECV with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip4) || ! runsip4 >/dev/null; then
@@ -7082,7 +7405,7 @@ N=$((N+1))
 
 NAME=UDP4RECV_TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of UDP4-RECV with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip4 libwrap) || ! runsip4 >/dev/null; then
@@ -7106,7 +7429,7 @@ N=$((N+1))
 
 NAME=UDP6RECVFROM_SOURCEPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%sourceport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%sourceport%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-RECVFROM with SOURCEPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6) || ! runsip6 >/dev/null; then
@@ -7121,7 +7444,7 @@ N=$((N+1))
 
 NAME=UDP6RECVFROM_LOWPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%lowport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%lowport%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-RECVFROM with LOWPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6) || ! runsip6 >/dev/null; then
@@ -7136,7 +7459,7 @@ N=$((N+1))
 
 NAME=UDP6RECVFROM_RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-RECVFROM with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip6) || ! runsip6 >/dev/null; then
@@ -7152,7 +7475,7 @@ N=$((N+1))
 
 NAME=UDP6RECVFROM_TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-RECVFROM with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6 libwrap) || ! runsip6 >/dev/null; then
@@ -7172,7 +7495,7 @@ N=$((N+1))
 
 NAME=UDP6RECV_SOURCEPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%sourceport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%sourceport%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-RECV with SOURCEPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6) || ! runsip6 >/dev/null; then
@@ -7192,7 +7515,7 @@ N=$((N+1))
 
 NAME=UDP6RECV_LOWPORT
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%lowport%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%lowport%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-RECV with LOWPORT option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6) || ! runsip6 >/dev/null; then
@@ -7211,7 +7534,7 @@ N=$((N+1))
 
 NAME=UDP6RECV_RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-RECV with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6) || ! runsip6 >/dev/null; then
@@ -7230,7 +7553,7 @@ N=$((N+1))
 
 NAME=UDP6RECV_TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp6%*|*%ip6%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: security of UDP6-RECV with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6 libwrap) || ! runsip6 >/dev/null; then
@@ -7254,7 +7577,7 @@ N=$((N+1))
 
 NAME=IP4RECVFROM_RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%ip%*|*%ip4%*|*%range%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%ip%*|*%ip4%*|*%range%*|*%root%*|*%$NAME%*)
 TEST="$NAME: security of IP4-RECVFROM with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4 rawip) || ! runsip4 >/dev/null; then
@@ -7274,7 +7597,7 @@ N=$((N+1))
 
 NAME=IP4RECVFROM_TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%ip%*|*%ip4%*|*%tcpwrap%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%ip%*|*%ip4%*|*%tcpwrap%*|*%root%*|*%$NAME%*)
 TEST="$NAME: security of IP4-RECVFROM with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4 rawip libwrap) || ! runsip4 >/dev/null; then
@@ -7300,7 +7623,7 @@ N=$((N+1))
 
 NAME=IP4RECV_RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%ip%*|*%ip4%*|*%range%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%ip%*|*%ip4%*|*%range%*|*%root%*|*%$NAME%*)
 TEST="$NAME: security of IP4-RECV with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4 rawip) || ! runsip4 >/dev/null; then
@@ -7324,7 +7647,7 @@ N=$((N+1))
 
 NAME=IP4RECV_TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%ip%*|*%ip4%*|*%tcpwrap%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%ip%*|*%ip4%*|*%tcpwrap%*|*%root%*|*%$NAME%*)
 TEST="$NAME: security of IP4-RECV with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4 rawip libwrap) || ! runsip4 >/dev/null; then
@@ -7351,7 +7674,7 @@ N=$((N+1))
 
 NAME=IP6RECVFROM_RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%ip%*|*%ip6%*|*%range%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%ip%*|*%ip6%*|*%range%*|*%root%*|*%$NAME%*)
 TEST="$NAME: security of IP6-RECVFROM with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip6 rawip) || ! runsip6 >/dev/null; then
@@ -7371,7 +7694,7 @@ N=$((N+1))
 
 NAME=IP6RECVFROM_TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%ip%*|*%ip6%*|*%tcpwrap%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%ip%*|*%ip6%*|*%tcpwrap%*|*%root%*|*%$NAME%*)
 TEST="$NAME: security of IP6-RECVFROM with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip6 rawip libwrap) || ! runsip6 >/dev/null; then
@@ -7396,7 +7719,7 @@ N=$((N+1))
 
 NAME=IP6RECV_RANGE
 case "$TESTS" in
-*%functions%*|*%security%*|*%ip%*|*%ip6%*|*%range%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%ip%*|*%ip6%*|*%range%*|*%root%*|*%$NAME%*)
 TEST="$NAME: security of IP6-RECV with RANGE option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip6 rawip) || ! runsip6 >/dev/null; then
@@ -7418,7 +7741,7 @@ N=$((N+1))
 
 NAME=IP6RECV_TCPWRAP
 case "$TESTS" in
-*%functions%*|*%security%*|*%ip%*|*%ip6%*|*%tcpwrap%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%ip%*|*%ip6%*|*%tcpwrap%*|*%root%*|*%$NAME%*)
 TEST="$NAME: security of IP6-RECV with TCPWRAP option"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip6 rawip libwrap) || ! runsip6 >/dev/null; then
@@ -7445,7 +7768,7 @@ N=$((N+1))
 
 NAME=O_NOATIME_FILE
 case "$TESTS" in
-*%functions%*|*%open%*|*%noatime%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%open%*|*%noatime%*|*%$NAME%*)
 TEST="$NAME: option O_NOATIME on file"
 # idea: create a file with o-noatime option; one second later create a file
 # without this option (using touch); one second later read from the first file.
@@ -7461,7 +7784,7 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
 $PRINTF "test $F_n $TEST... " $N
-CMD="$SOCAT $opts -u open:\"${tf}1\",o-noatime /dev/null"
+CMD="$TRACE $SOCAT $opts -u open:\"${tf}1\",o-noatime /dev/null"
 # generate a file
 touch "${tf}1"
 sleep 1
@@ -7475,14 +7798,16 @@ if [ $? -ne 0 ]; then # command failed
     echo "$CMD"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
 # check which file has a later atime stamp
 if [ $(ls -ltu "${tf}1" "${tf}2" |head -1 |sed 's/.* //') != "${tf}2" ];
 then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD"
    cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "$te"; fi
@@ -7495,7 +7820,7 @@ N=$((N+1))
 
 NAME=O_NOATIME_FD
 case "$TESTS" in
-*%functions%*|*%noatime%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%noatime%*|*%$NAME%*)
 TEST="$NAME: option O_NOATIME on file descriptor"
 # idea: use a fd of a file with o-noatime option; one second later create a file
 # without this option (using touch); one second later read from the first file.
@@ -7512,7 +7837,7 @@ tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
 $PRINTF "test $F_n $TEST... " $N
 touch ${tf}1
-CMD="$SOCAT $opts -u -,o-noatime /dev/null <${tf}1"
+CMD="$TRACE $SOCAT $opts -u -,o-noatime /dev/null <${tf}1"
 # generate a file, len >= 1
 touch "${tf}1"
 sleep 1
@@ -7526,14 +7851,16 @@ if [ $? -ne 0 ]; then # command failed
     echo "$CMD"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
 # check which file has a later atime stamp
 if [ $(ls -ltu "${tf}1" "${tf}2" |head -1 |sed 's/.* //') != "${tf}2" ];
 then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD"
    cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "$te"; fi
@@ -7546,7 +7873,7 @@ N=$((N+1))
 
 NAME=EXT2_NOATIME
 case "$TESTS" in
-*%functions%*|*%ext2%*|*%noatime%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ext2%*|*%noatime%*|*%$NAME%*)
 TEST="$NAME: extended file system options using ext2fs noatime option"
 # idea: create a file with ext2-noatime option; one second later create a file
 # without this option (using touch); one second later read from the first file.
@@ -7564,8 +7891,8 @@ tdiff="$td/test$N.diff"
 ts1="$ts"
 da="test$N $(date) $RANDOM"
 $PRINTF "test $F_n $TEST... " $N
-CMD0="$SOCAT $opts -u /dev/null create:\"${tf}1\""
-CMD="$SOCAT $opts -u /dev/null create:\"${tf}1\",ext2-noatime"
+CMD0="$TRACE $SOCAT $opts -u /dev/null create:\"${tf}1\""
+CMD="$TRACE $SOCAT $opts -u /dev/null create:\"${tf}1\",ext2-noatime"
 # check if this is a capable FS; lsattr does other things on AIX, thus socat
 $CMD0 2>"${te}0"
 if [ $? -ne 0 ]; then
@@ -7590,10 +7917,11 @@ cat "${tf}1" >/dev/null
 #if [ $(ls -ltu "${tf}1" "${tf}2" |head -n 1 |awk '{print($8);}') != "${tf}2" ];
 if [ $(ls -ltu "${tf}1" "${tf}2" |head -n 1 |sed "s|.*\\($td.*\\)|\1|g") != "${tf}2" ];
 then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD"
    cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "$te"; fi
@@ -7608,7 +7936,7 @@ N=$((N+1))
 
 NAME=COOLWRITE
 case "$TESTS" in
-*%functions%*|*%engine%*|*%timeout%*|*%ignoreeof%*|*%coolwrite%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%timeout%*|*%coolwrite%*|*%$NAME%*)
 TEST="$NAME: option cool-write"
 if ! eval $NUMCOND; then :;
 elif ! testoptions cool-write >/dev/null; then
@@ -7622,8 +7950,8 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
 # a reader that will terminate after 1 byte
-CMD1="$SOCAT $opts -u pipe:\"$ti\",readbytes=1 /dev/null"
-CMD="$SOCAT $opts -u - file:\"$ti\",cool-write"
+CMD1="$TRACE $SOCAT $opts -u pipe:\"$ti\",readbytes=1 /dev/null"
+CMD="$TRACE $SOCAT $opts -u - file:\"$ti\",cool-write"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 bg=$!	# background process id
@@ -7632,10 +7960,11 @@ sleep 1
 rc=$?
 kill $bg 2>/dev/null; wait
 if [ $rc -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD &"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "$te"; fi
@@ -7650,7 +7979,7 @@ N=$((N+1))
 # this failed up to socat 1.6.0.0
 NAME=COOLSTDIO
 case "$TESTS" in
-*%functions%*|*%engine%*|*%timeout%*|*%ignoreeof%*|*%coolwrite%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%timeout%*|*%coolwrite%*|*%$NAME%*)
 TEST="$NAME: option cool-write on bidirectional stdio"
 # this test starts a socat reader that terminates after receiving one+ 
 # bytes (option readbytes); and a test process that sends two bytes via
@@ -7670,8 +7999,8 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
 # a reader that will terminate after 1 byte
-CMD1="$SOCAT $opts -u pipe:\"$ti\",readbytes=1 /dev/null"
-CMD="$SOCAT $opts -,cool-write pipe >\"$ti\""
+CMD1="$TRACE $SOCAT $opts -u pipe:\"$ti\",readbytes=1 /dev/null"
+CMD="$TRACE $SOCAT $opts -,cool-write pipe >\"$ti\""
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 bg=$!	# background process id
@@ -7680,10 +8009,11 @@ sleep 1
 rc=$?
 kill $bg 2>/dev/null; wait
 if [ $rc -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD &"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "$te"; fi
@@ -7696,7 +8026,7 @@ N=$((N+1))
 
 NAME=TCP4ENDCLOSE
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: end-close keeps TCP V4 socket open"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
@@ -7706,9 +8036,9 @@ p1=$PORT; PORT=$((PORT+1))
 p2=$PORT
 da1a="$(date) $RANDOM"
 da1b="$(date) $RANDOM"
-CMD1="$SOCAT $opts -u - TCP4-CONNECT:$LOCALHOST:$p1"
-CMD="$SOCAT $opts -U TCP4:$LOCALHOST:$p2,end-close TCP4-LISTEN:$p1,bind=$LOCALHOST,reuseaddr,fork"
-CMD3="$SOCAT $opts -u TCP4-LISTEN:$p2,reuseaddr,bind=$LOCALHOST -"
+CMD1="$TRACE $SOCAT $opts -u - TCP4-CONNECT:$LOCALHOST:$p1"
+CMD="$TRACE $SOCAT $opts -U TCP4:$LOCALHOST:$p2,end-close TCP4-LISTEN:$p1,bind=$LOCALHOST,reuseaddr,fork"
+CMD3="$TRACE $SOCAT $opts -u TCP4-LISTEN:$p2,reuseaddr,bind=$LOCALHOST -"
 printf "test $F_n $TEST... " $N
 $CMD3 >"$tf" 2>"${te}3" &
 pid3=$!
@@ -7723,16 +8053,18 @@ sleep 1
 kill "$pid3" "$pid2" 2>/dev/null
 wait
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1a" "${te}1b" "${te}2" "${te}3"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! $ECHO "$da1a\n$da1b" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    cat "${te}1a" "${te}1b" "${te}2" "${te}3"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1a" "${te}1b" "${te}2" "${te}3"; fi
@@ -7746,7 +8078,7 @@ N=$((N+1))
 
 NAME=EXECENDCLOSE
 case "$TESTS" in
-*%functions%*|*%exec%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%exec%*|*%$NAME%*)
 TEST="$NAME: end-close keeps EXEC child running"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
@@ -7755,8 +8087,8 @@ ts="$td/test$N.sock"
 tdiff="$td/test$N.diff"
 da1a="$(date) $RANDOM"
 da1b="$(date) $RANDOM"
-CMD1="$SOCAT $opts - UNIX-CONNECT:$ts"
-CMD="$SOCAT $opts EXEC:"$CAT",end-close UNIX-LISTEN:$ts,fork"
+CMD1="$TRACE $SOCAT $opts - UNIX-CONNECT:$ts"
+CMD="$TRACE $SOCAT $opts EXEC:"$CAT",end-close UNIX-LISTEN:$ts,fork"
 printf "test $F_n $TEST... " $N
 $CMD 2>"${te}2" &
 pid2=$!
@@ -7768,16 +8100,18 @@ echo "$da1b" |$CMD1 2>>"${te}1b" >>"$tf"
 kill "$pid2" 2>/dev/null
 wait
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1a" "${te}1b" "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! $ECHO "$da1a\n$da1b" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    cat "${te}1a" "${te}1b" "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1a" "${te}1b" "${te}2"; fi
@@ -7792,7 +8126,7 @@ N=$((N+1))
 # bad internal handling. here we check it for address PTY
 NAME=PTYENDCLOSE
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: PTY handles option end-close"
 # with the bug, socat exits with error. we invoke socat in a no-op mode and
 # check its return status.
@@ -7800,7 +8134,7 @@ if ! eval $NUMCOND; then :;
  else
 tf="$td/test$N.stout"
 te="$td/test$N.stderr"
-CMD="$SOCAT $opts /dev/null pty,end-close"
+CMD="$TRACE $SOCAT $opts /dev/null pty,end-close"
 printf "test $F_n $TEST... " $N
 $CMD 2>"${te}"
 rc=$?
@@ -7812,6 +8146,7 @@ else
     echo "$CMD"
     cat "${te}"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -7822,7 +8157,7 @@ N=$((N+1))
 # test the shut-null and null-eof options
 NAME=SHUTNULLEOF
 case "$TESTS" in
-*%functions%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: options shut-null and null-eof"
 # run a receiving background process with option null-eof. 
 # start a sending process with option shut-null that sends a test record to the
@@ -7834,8 +8169,8 @@ tf="$td/test$N.stout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts -u UDP-RECV:$PORT,null-eof CREAT:$tf"
-CMD1="$SOCAT $opts -u - UDP-SENDTO:127.0.0.1:$PORT,shut-null"
+CMD0="$TRACE $SOCAT $opts -u UDP-RECV:$PORT,null-eof CREAT:$tf"
+CMD1="$TRACE $SOCAT $opts -u - UDP-SENDTO:127.0.0.1:$PORT,shut-null"
 printf "test $F_n $TEST... " $N
 $CMD0 >/dev/null 2>"${te}0" &
 pid0=$!
@@ -7853,6 +8188,7 @@ if [ $rc1 != 0 -o $rc2 != 0 ]; then
     cat "${te}1"
     cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif echo "$da" |diff - "${tf}" >"$tdiff"; then
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -7864,6 +8200,7 @@ else
     cat "${te}1"
     cat "${tdiff}"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -7875,7 +8212,7 @@ NAME=UDP6LISTENBIND
 # this tests for a bug in (up to) 1.5.0.0:
 #    with udp*-listen, the bind option supported only IPv4
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%ip6%*|*%ipapp%*|*%udp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%ip6%*|*%ipapp%*|*%udp%*|*%$NAME%*)
 TEST="$NAME: UDP6-LISTEN with bind"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs udp ip6) || ! runsip6 >/dev/null; then
@@ -7888,8 +8225,8 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="$LOCALHOST6:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts UDP6-LISTEN:$tsl,reuseaddr,bind=$LOCALHOST6 PIPE"
-CMD2="$SOCAT $opts - UDP6:$ts"
+CMD1="$TRACE $SOCAT $opts UDP6-LISTEN:$tsl,reuseaddr,bind=$LOCALHOST6 PIPE"
+CMD2="$TRACE $SOCAT $opts - UDP6:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1=$!
@@ -7898,15 +8235,17 @@ echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 rc2=$?
 kill $pid1 2>/dev/null; wait
 if [ $rc2 -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1" "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -7922,7 +8261,7 @@ NAME=TCPWRAPPERS_MULTIOPTS
 # this tests for a bug in 1.5.0.0 that let socat fail when more than one 
 # tcp-wrappers related option was specified in one address
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: use of multiple tcpwrapper enabling options"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip4 libwrap) || ! runsip4 >/dev/null; then
@@ -7935,23 +8274,25 @@ tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
 ha="$td/hosts.allow"
 $ECHO "test : ALL : allow" >"$ha"
-CMD1="$SOCAT $opts TCP4-LISTEN:$PORT,reuseaddr,hosts-allow=$ha,tcpwrap=test pipe"
-CMD2="$SOCAT $opts - TCP:$LOCALHOST:$PORT"
+CMD1="$TRACE $SOCAT $opts TCP4-LISTEN:$PORT,reuseaddr,hosts-allow=$ha,tcpwrap=test pipe"
+CMD2="$TRACE $SOCAT $opts - TCP:$LOCALHOST:$PORT"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 waittcp4port $PORT
 echo "$da" |$CMD2 >"$tf" 2>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -7967,7 +8308,7 @@ NAME=TCPWRAPPERS_TCP6ADDR
 # this tests for a bug in 1.5.0.0 that brought false results with tcp-wrappers
 # and IPv6 when 
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%tcpwrap%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%tcp%*|*%tcp6%*|*%ip6%*|*%tcpwrap%*|*%$NAME%*)
 TEST="$NAME: specification of TCP6 address in hosts.allow"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs tcp ip6 libwrap) || ! runsip6 >/dev/null; then
@@ -7982,8 +8323,8 @@ ha="$td/hosts.allow"
 hd="$td/hosts.deny"
 $ECHO "socat : [::1] : allow" >"$ha"
 $ECHO "ALL : ALL : deny" >"$hd"
-CMD1="$SOCAT $opts TCP6-LISTEN:$PORT,reuseaddr,tcpwrap-etc=$td pipe"
-CMD2="$SOCAT $opts - TCP6:[::1]:$PORT"
+CMD1="$TRACE $SOCAT $opts TCP6-LISTEN:$PORT,reuseaddr,tcpwrap-etc=$td,tcpwrappers=socat pipe"
+CMD2="$TRACE $SOCAT $opts - TCP6:[::1]:$PORT"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 pid1=$!
@@ -7991,16 +8332,18 @@ waittcp6port $PORT
 echo "$da" |$CMD2 >"$tf" 2>"${te}2"
 kill $pid1 2>/dev/null; wait
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -8014,7 +8357,7 @@ N=$((N+1))
 
 NAME=UDP4BROADCAST
 case "$TESTS" in
-*%functions%*|*%udp%*|*%udp4%*|*%ip4%*|*%dgram%*|*%broadcast%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%udp%*|*%udp4%*|*%ip4%*|*%dgram%*|*%broadcast%*|*%$NAME%*)
 TEST="$NAME: UDP/IPv4 broadcast"
 if ! eval $NUMCOND; then :;
 elif [ -z "$BCADDR" ]; then
@@ -8030,9 +8373,9 @@ ts1="$BCADDR:$ts1p"
 ts2p=$PORT; PORT=$((PORT+1))
 ts2="$BCIFADDR:$ts2p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts UDP4-RECVFROM:$ts1p,reuseaddr,broadcast PIPE"
-#CMD2="$SOCAT $opts - UDP4-BROADCAST:$ts1"
-CMD2="$SOCAT $opts - UDP4-DATAGRAM:$ts1,broadcast"
+CMD1="$TRACE $SOCAT $opts UDP4-RECVFROM:$ts1p,reuseaddr,broadcast PIPE"
+#CMD2="$TRACE $SOCAT $opts - UDP4-BROADCAST:$ts1"
+CMD2="$TRACE $SOCAT $opts - UDP4-DATAGRAM:$ts1,broadcast"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 pid1="$!"
@@ -8041,16 +8384,18 @@ echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 rc2="$?"
 kill "$pid1" 2>/dev/null; wait;
 if [ "$rc2" -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     echo "$CMD2"
     cat "${te}1"
     cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
     $PRINTF "$FAILED\n"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$tut" ]; then
@@ -8070,7 +8415,7 @@ NAME=IP4BROADCAST
 # because we receive - in addition to the regular reply - our own broadcast,
 # we use a token XXXX that is changed to YYYY in the regular reply packet.
 case "$TESTS" in
-*%functions%*|*%engine%*|*%rawip%*|*%rawip4%*|*%ip4%*|*%dgram%*|*%broadcast%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%rawip%*|*%rawip4%*|*%ip4%*|*%dgram%*|*%broadcast%*|*%root%*|*%$NAME%*)
 TEST="$NAME: raw IPv4 broadcast"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4 rawip) || ! runsip4 >/dev/null; then
@@ -8094,9 +8439,9 @@ da="test$N $(date) $RANDOM XXXX"
 sh="$td/test$N-sed.sh"
 echo 'sed s/XXXX/YYYY/' >"$sh"
 chmod a+x "$sh"
-CMD1="$SOCAT $opts IP4-RECVFROM:$ts1p,reuseaddr,broadcast exec:$sh"
-#CMD2="$SOCAT $opts - IP4-BROADCAST:$ts1"
-CMD2="$SOCAT $opts - IP4-DATAGRAM:$ts1,broadcast"
+CMD1="$TRACE $SOCAT $opts IP4-RECVFROM:$ts1p,reuseaddr,broadcast exec:$sh"
+#CMD2="$TRACE $SOCAT $opts - IP4-BROADCAST:$ts1"
+CMD2="$TRACE $SOCAT $opts - IP4-DATAGRAM:$ts1,broadcast"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 pid1="$!"
@@ -8105,16 +8450,18 @@ echo "$da" |$CMD2 2>>"${te}2" |grep -v XXXX >>"$tf"
 rc2="$?"
 kill "$pid1" 2>/dev/null; wait;
 if [ "$rc2" -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     echo "$CMD2"
     cat "${te}1"
     cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" | sed 's/XXXX/YYYY/'|diff - "$tf" >"$tdiff"; then
     $PRINTF "$FAILED\n"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat $te; fi
@@ -8128,7 +8475,7 @@ N=$((N+1))
 
 #NAME=UDP4BROADCAST_RANGE
 #case "$TESTS" in
-#*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%dgram%*|*%broadcast%*|*%range%*|*%$NAME%*)
+#*%$N%*|*%functions%*|*%security%*|*%udp%*|*%udp4%*|*%ip4%*|*%dgram%*|*%broadcast%*|*%range%*|*%$NAME%*)
 #TEST="$NAME: security of UDP4-BROADCAST with RANGE option"
 #if ! eval $NUMCOND; then :;
 #elif [ -z "$BCADDR" ]; then
@@ -8143,7 +8490,7 @@ N=$((N+1))
 
 NAME=UDP4MULTICAST_UNIDIR
 case "$TESTS" in
-*%functions%*|*%udp%*|*%udp4%*|*%ip4%*|*%dgram%*|*%multicast%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%udp%*|*%udp4%*|*%ip4%*|*%dgram%*|*%multicast%*|*%$NAME%*)
 TEST="$NAME: UDP/IPv4 multicast, send only"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4 udp) || ! runsip4 >/dev/null; then
@@ -8157,8 +8504,8 @@ ts1p=$PORT; PORT=$((PORT+1))
 ts1a="$SECONDADDR"
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT -u $opts UDP4-RECV:$ts1p,reuseaddr,ip-add-membership=224.255.255.254:$ts1a -"
-CMD2="$SOCAT -u $opts - UDP4-SENDTO:224.255.255.254:$ts1p,bind=$ts1a"
+CMD1="$TRACE $SOCAT -u $opts UDP4-RECV:$ts1p,reuseaddr,ip-add-membership=224.255.255.254:$ts1a -"
+CMD2="$TRACE $SOCAT -u $opts - UDP4-SENDTO:224.255.255.254:$ts1p,bind=$ts1a"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1"  >"${tf}" &
 pid1="$!"
@@ -8168,16 +8515,18 @@ rc2="$?"
 usleep $MICROS
 kill "$pid1" 2>/dev/null; wait;
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -8189,7 +8538,7 @@ N=$((N+1))
 
 NAME=IP4MULTICAST_UNIDIR
 case "$TESTS" in
-*%functions%*|*%rawip%*|*%ip4%*|*%dgram%*|*%multicast%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%rawip%*|*%ip4%*|*%dgram%*|*%multicast%*|*%root%*|*%$NAME%*)
 TEST="$NAME: IPv4 multicast"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4 rawip) || ! runsip4 >/dev/null; then
@@ -8206,8 +8555,8 @@ ts1p=$PROTO
 ts1a="$SECONDADDR"
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT -u $opts IP4-RECV:$ts1p,reuseaddr,ip-add-membership=224.255.255.254:$ts1a -"
-CMD2="$SOCAT -u $opts - IP4-SENDTO:224.255.255.254:$ts1p,bind=$ts1a"
+CMD1="$TRACE $SOCAT -u $opts IP4-RECV:$ts1p,reuseaddr,ip-add-membership=224.255.255.254:$ts1a -"
+CMD2="$TRACE $SOCAT -u $opts - IP4-SENDTO:224.255.255.254:$ts1p,bind=$ts1a"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1"  >"${tf}" &
 pid1="$!"
@@ -8219,16 +8568,18 @@ rc2="$?"
 sleep 1
 kill "$pid1" 2>/dev/null; wait;
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -8242,7 +8593,7 @@ N=$((N+1))
 if false; then
 NAME=UDP6MULTICAST_UNIDIR
 case "$TESTS" in
-*%functions%*|*%udp%*|*%udp6%*|*%ip6%*|*%dgram%*|*%multicast%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%udp%*|*%udp6%*|*%ip6%*|*%dgram%*|*%multicast%*|*%$NAME%*)
 TEST="$NAME: UDP/IPv6 multicast"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip6 udp) || ! runsip6 >/dev/null; then
@@ -8256,8 +8607,8 @@ ts1p=$PORT; PORT=$((PORT+1))
 if1="$MCINTERFACE"
 ts1a="[::1]"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT -u $opts UDP6-RECV:$ts1p,reuseaddr,ipv6-join-group=[ff02::2]:$if1 -"
-CMD2="$SOCAT -u $opts - UDP6-SENDTO:[ff02::2]:$ts1p,bind=$ts1a"
+CMD1="$TRACE $SOCAT -u $opts UDP6-RECV:$ts1p,reuseaddr,ipv6-join-group=[ff02::2]:$if1 -"
+CMD2="$TRACE $SOCAT -u $opts - UDP6-SENDTO:[ff02::2]:$ts1p,bind=$ts1a"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1"  >"${tf}" &
 pid1="$!"
@@ -8267,16 +8618,18 @@ rc2="$?"
 usleep $MICROS
 kill "$pid1" 2>/dev/null; wait;
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -8289,7 +8642,7 @@ fi # false
 
 NAME=UDP4MULTICAST_BIDIR
 case "$TESTS" in
-*%functions%*|*%udp%*|*%udp4%*|*%ip4%*|*%dgram%*|*%multicast%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%udp%*|*%udp4%*|*%ip4%*|*%dgram%*|*%multicast%*|*%$NAME%*)
 TEST="$NAME: UDP/IPv4 multicast, with reply"
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.stdout"
@@ -8301,9 +8654,9 @@ ts1="$ts1a:$ts1p"
 ts2p=$PORT; PORT=$((PORT+1))
 ts2="$BCIFADDR:$ts2p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts UDP4-RECVFROM:$ts1p,reuseaddr,ip-add-membership=224.255.255.254:$ts1a PIPE"
-#CMD2="$SOCAT $opts - UDP4-MULTICAST:224.255.255.254:$ts1p,bind=$ts1a"
-CMD2="$SOCAT $opts - UDP4-DATAGRAM:224.255.255.254:$ts1p,bind=$ts1a"
+CMD1="$TRACE $SOCAT $opts UDP4-RECVFROM:$ts1p,reuseaddr,ip-add-membership=224.255.255.254:$ts1a PIPE"
+#CMD2="$TRACE $SOCAT $opts - UDP4-MULTICAST:224.255.255.254:$ts1p,bind=$ts1a"
+CMD2="$TRACE $SOCAT $opts - UDP4-DATAGRAM:224.255.255.254:$ts1p,bind=$ts1a"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 pid1="$!"
@@ -8312,16 +8665,18 @@ echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 rc2="$?"
 kill "$pid1" 2>/dev/null; wait;
 if [ "$rc2" -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     echo "$CMD2"
     cat "${te}1"
     cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
     $PRINTF "$FAILED\n"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$tut" ]; then
@@ -8337,7 +8692,7 @@ N=$((N+1))
 
 NAME=IP4MULTICAST_BIDIR
 case "$TESTS" in
-*%functions%*|*%rawip%*|*%ip4%*|*%dgram%*|*%multicast%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%rawip%*|*%ip4%*|*%dgram%*|*%multicast%*|*%root%*|*%$NAME%*)
 TEST="$NAME: IPv4 multicast, with reply"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs ip4 rawip) || ! runsip4 >/dev/null; then
@@ -8354,9 +8709,9 @@ ts1p=$PROTO
 ts1a="$SECONDADDR"
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts IP4-RECVFROM:$ts1p,reuseaddr,ip-add-membership=224.255.255.254:$ts1a PIPE"
-#CMD2="$SOCAT $opts - IP4-MULTICAST:224.255.255.254:$ts1p,bind=$ts1a"
-CMD2="$SOCAT $opts - IP4-DATAGRAM:224.255.255.254:$ts1p,bind=$ts1a"
+CMD1="$TRACE $SOCAT $opts IP4-RECVFROM:$ts1p,reuseaddr,ip-add-membership=224.255.255.254:$ts1a PIPE"
+#CMD2="$TRACE $SOCAT $opts - IP4-MULTICAST:224.255.255.254:$ts1p,bind=$ts1a"
+CMD2="$TRACE $SOCAT $opts - IP4-DATAGRAM:224.255.255.254:$ts1p,bind=$ts1a"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 pid1="$!"
@@ -8366,16 +8721,18 @@ echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 rc2="$?"
 kill "$pid1" 2>/dev/null; wait;
 if [ "$rc2" -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     echo "$CMD2"
     cat "${te}1"
     cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
     $PRINTF "$FAILED\n"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$tut" ]; then
@@ -8393,7 +8750,7 @@ N=$((N+1))
 
 NAME=TUNREAD
 case "$TESTS" in
-*%functions%*|*%tun%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%tun%*|*%root%*|*%$NAME%*)
 TEST="$NAME: reading data sent through tun interface"
 #idea: create a TUN interface and send a datagram to one of the addresses of
 # its virtual network. On the tunnel side, read the packet and compare its last
@@ -8413,9 +8770,9 @@ tl="$td/test$N.lock"
 da="test$N $(date) $RANDOM"
 dalen=$((${#da}+1))
 TUNNET=10.255.255
-CMD1="$SOCAT $opts -u - UDP4-SENDTO:$TUNNET.2:$PORT"
-#CMD="$SOCAT $opts -u -L $tl TUN,ifaddr=$TUNNET.1,netmask=255.255.255.0,iff-up=1 -"
-CMD="$SOCAT $opts -u -L $tl TUN:$TUNNET.1/24,iff-up=1 -"
+CMD1="$TRACE $SOCAT $opts -u - UDP4-SENDTO:$TUNNET.2:$PORT"
+#CMD="$TRACE $SOCAT $opts -u -L $tl TUN,ifaddr=$TUNNET.1,netmask=255.255.255.0,iff-up=1 -"
+CMD="$TRACE $SOCAT $opts -u -L $tl TUN:$TUNNET.1/24,iff-up=1 -"
 printf "test $F_n $TEST... " $N
 $CMD 2>"${te}" |tail -c $dalen >"${tf}" &
 sleep 1
@@ -8424,16 +8781,18 @@ sleep 1
 kill "$(cat $tl 2>/dev/null)" 2>/dev/null
 wait
 if [ $? -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD &"
     echo "$CMD1"
     cat "${te}" "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
     $PRINTF "$FAILED\n"
     cat "$tdiff"
     cat "${te}" "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat "${te}" "${te}1"; fi
@@ -8449,7 +8808,7 @@ N=$((N+1))
 # transparent 
 NAME=TUNINTERFACE
 case "$TESTS" in
-*%functions%*|*%tun%*|*%interface%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%tun%*|*%interface%*|*%root%*|*%$NAME%*)
 TEST="$NAME: pass data through tun interface using INTERFACE"
 #idea: create a TUN interface and send a raw packet on the interface side.
 # It should arrive unmodified on the tunnel side.
@@ -8469,8 +8828,8 @@ da="$(date) $RANDOM"
 dalen=$((${#da}+1))
 TUNNET=10.255.255
 TUNNAME=tun9
-CMD1="$SOCAT $opts -L $tl TUN:$TUNNET.1/24,iff-up=1,tun-type=tun,tun-name=$TUNNAME echo"
-CMD="$SOCAT $opts - INTERFACE:$TUNNAME"
+CMD1="$TRACE $SOCAT $opts -L $tl TUN:$TUNNET.1/24,iff-up=1,tun-type=tun,tun-name=$TUNNAME echo"
+CMD="$TRACE $SOCAT $opts - INTERFACE:$TUNNAME"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}1" &
 pid1="$!"
@@ -8480,16 +8839,18 @@ echo "$da" |$CMD 2>"${te}1" >"$tf" 2>"${te}"
 kill $pid1 2>/dev/null
 wait
 if [ $? -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD &"
     echo "$CMD1"
     cat "${te}" "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
     $PRINTF "$FAILED\n"
     cat "$tdiff"
     cat "${te}" "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat "${te}" "${te}1"; fi
@@ -8503,7 +8864,7 @@ N=$((N+1))
 
 NAME=ABSTRACTSTREAM
 case "$TESTS" in
-*%functions%*|*%unix%*|*%abstract%*|*%connect%*|*%listen%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%unix%*|*%abstract%*|*%connect%*|*%listen%*|*%$NAME%*)
 TEST="$NAME: abstract UNIX stream socket, listen and connect"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs abstract-unixsocket); then
@@ -8516,9 +8877,9 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da1="test$N $(date) $RANDOM"
 #establish a listening abstract unix socket
-SRV="$SOCAT $opts -lpserver ABSTRACT-LISTEN:\"$ts\" PIPE"
+SRV="$TRACE $SOCAT $opts -lpserver ABSTRACT-LISTEN:\"$ts\" PIPE"
 #make a connection
-CMD="$SOCAT $opts - ABSTRACT-CONNECT:$ts"
+CMD="$TRACE $SOCAT $opts - ABSTRACT-CONNECT:$ts"
 $PRINTF "test $F_n $TEST... " $N
 touch "$ts"	# make a file with same name, so non-abstract fails
 eval "$SRV 2>${te}s &"
@@ -8534,6 +8895,7 @@ if [ $? -ne 0 ]; then
     echo "$CMD"
     cat "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da1" |diff - "${tf}1" >"$tdiff"; then
     kill "$pids" 2>/dev/null
     $PRINTF "$FAILED:\n"
@@ -8543,6 +8905,7 @@ elif ! echo "$da1" |diff - "${tf}1" >"$tdiff"; then
     cat "${te}1"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -8556,7 +8919,7 @@ N=$((N+1))
 
 NAME=ABSTRACTDGRAM
 case "$TESTS" in
-*%functions%*|*%unix%*|*%abstract%*|*%dgram%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%unix%*|*%abstract%*|*%dgram%*|*%$NAME%*)
 TEST="$NAME: abstract UNIX datagram"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs abstract-unixsocket); then
@@ -8569,9 +8932,9 @@ tdiff="$td/test$N.diff"
 ts1="$td/test$N.socket1"
 ts2="$td/test$N.socket2"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts ABSTRACT-RECVFROM:$ts1,reuseaddr PIPE"
-#CMD2="$SOCAT $opts - ABSTRACT-SENDTO:$ts1,bind=$ts2"
-CMD2="$SOCAT $opts - ABSTRACT-SENDTO:$ts1,bind=$ts2"
+CMD1="$TRACE $SOCAT $opts ABSTRACT-RECVFROM:$ts1,reuseaddr PIPE"
+#CMD2="$TRACE $SOCAT $opts - ABSTRACT-SENDTO:$ts1,bind=$ts2"
+CMD2="$TRACE $SOCAT $opts - ABSTRACT-SENDTO:$ts1,bind=$ts2"
 printf "test $F_n $TEST... " $N
 touch "$ts1"	# make a file with same name, so non-abstract fails
 $CMD1 2>"${te}1" &
@@ -8581,16 +8944,18 @@ echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 rc2=$?
 kill "$pid1" 2>/dev/null; wait
 if [ $rc2 -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    cat "${te}1"
    echo "$CMD2"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -8603,7 +8968,7 @@ N=$((N+1))
 
 NAME=ABSTRACTRECV
 case "$TESTS" in
-*%functions%*|*%unix%*|*%abstract%*|*%dgram%*|*%recv%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%unix%*|*%abstract%*|*%dgram%*|*%recv%*|*%$NAME%*)
 TEST="$NAME: abstract UNIX datagram receive"
 if ! eval $NUMCOND; then :;
 elif ! feat=$(testaddrs abstract-unixsocket); then
@@ -8616,8 +8981,8 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 ts1="$ts"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -u ABSTRACT-RECV:$ts1,reuseaddr -"
-CMD2="$SOCAT $opts -u - ABSTRACT-SENDTO:$ts1"
+CMD1="$TRACE $SOCAT $opts -u ABSTRACT-RECV:$ts1,reuseaddr -"
+CMD2="$TRACE $SOCAT $opts -u - ABSTRACT-SENDTO:$ts1"
 printf "test $F_n $TEST... " $N
 touch "$ts1"	# make a file with same name, so non-abstract fails
 $CMD1 >"$tf" 2>"${te}1" &
@@ -8629,16 +8994,18 @@ rc2="$?"
 i=0; while [ ! -s "$tf" -a "$i" -lt 10 ]; do  usleep 100000; i=$((i+1));  done
 kill "$pid1" 2>/dev/null; wait
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -8646,6 +9013,54 @@ else
 fi
 fi ;; # NUMCOND, feats
 esac
+N=$((N+1))
+
+
+# bind with Linux abstract UNIX domain addresses bound to filesystem socket
+# instead of abstract namespace
+NAME=ABSTRACT_BIND
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%socket%*|*%unix%*|*%abstract%*|*%$NAME%*)
+TEST="$NAME: abstract bind"
+# open an abstract client address with bind option, bind to the target socket.
+# send a datagram. 
+# when socat outputs the datagram it got the test succeeded
+if ! eval $NUMCOND; then :; 
+elif [ "$UNAME" != Linux ]; then
+    $PRINTF "test $F_n $TEST... ${YELLOW}only on Linux${NORMAL}\n" $N
+    numCANT=$((numCANT+1))
+else
+tf="$td/test$N.stdout"
+te="$td/test$N.stderr"
+tdiff="$td/test$N.diff"
+ts1="$td/test$N.sock1"
+da="test$N $(date) $RANDOM"
+CMD1="$TRACE $SOCAT $opts - ABSTRACT-SENDTO:$ts1,bind=$ts1"
+printf "test $F_n $TEST... " $N
+echo "$da" |$CMD1 >$tf 2>"${te}1"
+rc1=$?
+if [ $rc1 -ne 0 ]; then
+    $PRINTF "$FAILED\n"
+    echo "$CMD1" >&2
+    echo "rc=$rc1" >&2
+    cat "${te}1" >&2
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+elif echo "$da" |diff -q - $tf; then
+    $PRINTF "$OK\n"
+    numOK=$((numOK+1))
+else
+    $PRINTF "$FAILED\n"
+    echo "$CMD1" >&2
+    cat "${te}1" >&2
+    echo "$da" |diff - "$tf" >&2
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+fi
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
 N=$((N+1))
 
 
@@ -8659,7 +9074,7 @@ NAME=OPENSSLREAD
 # keeps there and is not transferred by socat until the socket indicates more
 # data or EOF.
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%$NAME%*)
 TEST="$NAME: socat handles data buffered by openssl"
 #idea: have a socat process (server) that gets an SSL block that is larger than
 # socat transfer block size; keep the socket connection open and kill the
@@ -8676,8 +9091,8 @@ tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
 SRVCERT=testsrv
 gentestcert "$SRVCERT"
-CMD1="$SOCAT $opts -u -T 1 -b $($ECHO "$da\c" |wc -c) OPENSSL-LISTEN:$PORT,reuseaddr,cert=$SRVCERT.pem,verify=0 -"
-CMD2="$SOCAT $opts -u - OPENSSL-CONNECT:$LOCALHOST:$PORT,verify=0"
+CMD1="$TRACE $SOCAT $opts -u -T 1 -b $($ECHO "$da\c" |wc -c) OPENSSL-LISTEN:$PORT,reuseaddr,cert=$SRVCERT.pem,verify=0 -"
+CMD2="$TRACE $SOCAT $opts -u - OPENSSL-CONNECT:$LOCALHOST:$PORT,verify=0"
 printf "test $F_n $TEST... " $N
 #
 $CMD1 2>"${te}1" >"$tf" &
@@ -8686,13 +9101,14 @@ waittcp4port $PORT
 (echo "$da"; sleep 2) |$CMD2 2>"${te}2"
 kill "$pid" 2>/dev/null; wait
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1"
     cat "${te}1"
     echo "$CMD2"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -8712,7 +9128,7 @@ N=$((N+1))
 NAME=READBYTES_EOF
 #set -vx
 case "$TESTS" in
-*%functions%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$NAME%*)
 TEST="$NAME: trigger EOF after that many bytes, even when socket idle"
 #idea: we deliver that many bytes to socat; the process should terminate then.
 # we try to transfer data in the other direction then; if transfer succeeds,
@@ -8728,13 +9144,14 @@ to="$td/test$N.out"
 te="$td/test$N.err"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"; da="$da$($ECHO '\r')"
-CMD="$SOCAT $opts system:\"echo A; sleep $((2*SECONDs))\",readbytes=2!!- -!!/dev/null"
+CMD="$TRACE $SOCAT $opts SYSTEM:\"echo A; sleep $((2*SECONDs))\",readbytes=2!!- -!!/dev/null"
 printf "test $F_n $TEST... " $N
 (usleep $((2*MICROS)); echo) |eval "$CMD" >"$to" 2>"$te"
 if test -s "$to"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -8749,7 +9166,7 @@ N=$((N+1))
 # process under some circumstances.
 NAME=EXECPTYKILL
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%exec%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%exec%*|*%$NAME%*)
 TEST="$NAME: exec:...,pty explicitely kills sub process"
 # we want to check if the exec'd sub process is killed in time
 # for this we have a shell script that generates a file after two seconds;
@@ -8766,8 +9183,8 @@ cat >"$tsh" <<EOF
 sleep $SECONDs; echo; sleep $SECONDs;  touch "$tda"; echo
 EOF
 chmod a+x "$tsh"
-CMD1="$SOCAT $opts -t $SECONDs -U UNIX-LISTEN:$ts,fork EXEC:$tsh,pty"
-CMD="$SOCAT $opts -t $SECONDs /dev/null UNIX-CONNECT:$ts"
+CMD1="$TRACE $SOCAT $opts -t $SECONDs -U UNIX-LISTEN:$ts,fork EXEC:$tsh,pty"
+CMD="$TRACE $SOCAT $opts -t $SECONDs /dev/null UNIX-CONNECT:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 2>"${te}2" &
 pid1=$!
@@ -8778,15 +9195,17 @@ sleep $((2*SECONDs))
 kill "$pid1" 2>/dev/null
 wait
 if [ $? -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     echo "$CMD2"
     cat "${te}1" "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif [ -f "$tda" ]; then
     $PRINTF "$FAILED\n"
     cat "${te}1" "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -8801,7 +9220,7 @@ N=$((N+1))
 # test if service name resolution works; this was buggy in 1.5 and 1.6.0.0
 NAME=TCP4SERVICE
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$NAME%*)
 TEST="$NAME: echo via connection to TCP V4 socket"
 # select a tcp entry from /etc/services, have a server listen on the port 
 # number and connect using the service name; with the bug, connection will to a
@@ -8818,24 +9237,26 @@ PORT="$(echo $SERVENT |sed 's/.* \([1-9][0-9]*\).*/\1/')"
 tsl="$PORT"
 ts="127.0.0.1:$SERVICE"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts TCP4-LISTEN:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout TCP4:$ts"
+CMD1="$TRACE $SOCAT $opts TCP4-LISTEN:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout TCP4:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1=$!
 waittcp4port $tsl 1
 echo "$da" |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    cat "${te}1"
    echo "$CMD2"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -8865,7 +9286,7 @@ N=$((N+1))
 #   SunOS 8:		20			1024
 NAME=EXCEED_FOPEN_MAX
 case "$TESTS" in
-*%functions%*|*%maxfds%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%maxfds%*|*%$NAME%*)
 TEST="$NAME: more than FOPEN_MAX FDs in use"
 # this test opens a number of FDs before socat is invoked. socat will have to
 # allocate higher FD numbers and thus hang if it cannot handle them.
@@ -8897,7 +9318,7 @@ N=$((N+1))
 # zombies because the master process did not catch SIGCHLD
 NAME=UDP4LISTEN_SIGCHLD
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%ipapp%*|*%udp%*|*%zombie%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%udp%*|*%zombie%*|*%signal%*|*%$NAME%*)
 TEST="$NAME: test if UDP4-LISTEN child becomes zombie"
 # idea: run a udp-listen process with fork and -T. Connect once, so a sub
 # process is forked off. Make some transfer and wait until the -T timeout is
@@ -8910,8 +9331,8 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="$LOCALHOST:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -T 0.5 UDP4-LISTEN:$tsl,reuseaddr,fork PIPE"
-CMD2="$SOCAT $opts - UDP4:$ts"
+CMD1="$TRACE $SOCAT $opts -T 0.5 UDP4-LISTEN:$tsl,reuseaddr,fork PIPE"
+CMD2="$TRACE $SOCAT $opts - UDP4:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1=$!
@@ -8929,11 +9350,12 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
     $PRINTF "$NO_RESULT (diff failed)\n"	# already handled in test UDP4STREAM
     numCANT=$((numCANT+1))
 elif $(isdefunct "$l"); then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     echo "$CMD2"
     cat "${te}1" "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -8949,7 +9371,7 @@ N=$((N+1))
 # zombies because the master process caught SIGCHLD but did not wait()
 NAME=UDP4RECVFROM_SIGCHLD
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%udp%*|*%dgram%*|*%zombie%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%udp%*|*%dgram%*|*%zombie%*|*%signal%*|*%$NAME%*)
 TEST="$NAME: test if UDP4-RECVFROM child becomes zombie"
 # idea: run a udp-recvfrom process with fork and -T. Send it one packet, so a
 # sub process is forked off. Make some transfer and wait until the -T timeout
@@ -8962,8 +9384,8 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="$LOCALHOST:$tsl"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -T 0.5 UDP4-RECVFROM:$tsl,reuseaddr,fork PIPE"
-CMD2="$SOCAT $opts - UDP4-SENDTO:$ts"
+CMD1="$TRACE $SOCAT $opts -T 0.5 UDP4-RECVFROM:$tsl,reuseaddr,fork PIPE"
+CMD2="$TRACE $SOCAT $opts - UDP4-SENDTO:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1=$!
@@ -8981,11 +9403,12 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
     $PRINTF "$NO_RESULT\n"	# already handled in test UDP4DGRAM
     numCANT=$((numCANT+1))
 elif $(isdefunct "$l"); then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     echo "$CMD2"
     cat "${te}1" "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -9003,7 +9426,7 @@ N=$((N+1))
 # occurred
 NAME=RAWIP4RECVBIND
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%dgram%*|*%rawip%*|*%rawip4%*|*%recv%*|*%root%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%dgram%*|*%rawip%*|*%rawip4%*|*%recv%*|*%root%*|*%$NAME%*)
 TEST="$NAME: raw IPv4 receive with bind"
 # idea: start a socat process with ip4-recv:...,bind=... and send it a packet
 # if the packet passes the test succeeded
@@ -9019,8 +9442,8 @@ ts1p=$PROTO; PROTO=$((PROTO+1))
 ts1a="127.0.0.1"
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -u IP4-RECV:$ts1p,bind=$ts1a,reuseaddr -"
-CMD2="$SOCAT $opts -u - IP4-SENDTO:$ts1"
+CMD1="$TRACE $SOCAT $opts -u IP4-RECV:$ts1p,bind=$ts1a,reuseaddr -"
+CMD2="$TRACE $SOCAT $opts -u - IP4-SENDTO:$ts1"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1="$!"
@@ -9031,16 +9454,18 @@ rc2="$?"
 i=0; while [ ! -s "$tf" -a "$i" -lt 10 ]; do  usleep 100000; i=$((i+1));  done
 kill "$pid1" 2>/dev/null; wait
 if [ "$rc2" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    echo "$CMD2"
    cat "${te}1"
    cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -9057,7 +9482,7 @@ N=$((N+1))
 # child process.
 NAME=UDP4RECVFROM_FORK
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%udp%*|*%dgram%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%udp%*|*%dgram%*|*%$NAME%*)
 TEST="$NAME: test if UDP4-RECVFROM handles more than one packet"
 # idea: run a UDP4-RECVFROM process with fork and -T. Send it one packet;
 # send it a second packet and check if this is processed properly. If yes, the
@@ -9069,8 +9494,8 @@ tdiff="$td/test$N.diff"
 tsp=$PORT
 ts="$LOCALHOST:$tsp"
 da="test$N $(date) $RANDOM"
-CMD1="$SOCAT $opts -T 2 UDP4-RECVFROM:$tsp,reuseaddr,fork PIPE"
-CMD2="$SOCAT $opts -T 1 - UDP4-SENDTO:$ts"
+CMD1="$TRACE $SOCAT $opts -T 2 UDP4-RECVFROM:$tsp,reuseaddr,fork PIPE"
+CMD2="$TRACE $SOCAT $opts -T 1 - UDP4-SENDTO:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >/dev/null 2>"${te}1" &
 pid1=$!
@@ -9085,12 +9510,13 @@ if [ $rc2b -ne 0 ]; then
     $PRINTF "$NO_RESULT\n"
     numCANT=$((numCANT+1))
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD1 &"
     echo "$CMD2"
     cat "${te}1" "${te}2" "${te}3"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat "${te}1" "${te}2" "${te}3"; fi
@@ -9106,7 +9532,7 @@ N=$((N+1))
 # in additional empty arguments
 NAME=EXECSPACES
 case "$TESTS" in
-*%functions%*|*%exec%*|*%parse%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%exec%*|*%parse%*|*%$NAME%*)
 TEST="$NAME: correctly parse exec with consecutive spaces"
 if ! eval $NUMCOND; then :; else
 $PRINTF "test $F_n $TEST... " $N
@@ -9116,19 +9542,21 @@ da="test$N $(date)  $RANDOM"	# with a double space
 tdiff="$td/test$N.diff"
 # put the test data as first argument after two spaces. expect the data in the
 # first argument of the exec'd command.
-$SOCAT $opts -u "exec:\"bash -c \\\"echo \\\\\\\"\$1\\\\\\\"\\\"  \\\"\\\" \\\"$da\\\"\"" - >"$tf" 2>"$te"
+$TRACE $SOCAT $opts -u "exec:\"bash -c \\\"echo \\\\\\\"\$1\\\\\\\"\\\"  \\\"\\\" \\\"$da\\\"\"" - >"$tf" 2>"$te"
 rc=$?
 echo "$da" |diff - "$tf" >"$tdiff"
 if [ "$rc" -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif [ -s "$tdiff" ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo diff:
     cat "$tdiff"
     if [ -n "$debug" ]; then cat $te; fi
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat $te; fi
@@ -9144,7 +9572,7 @@ N=$((N+1))
 # range option, the old listen socket would not be closed but a new one created.
 NAME=UDP4LISTENCONT
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%ip4%*|*%udp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%ip4%*|*%udp%*|*%$NAME%*)
 TEST="$NAME: let range drop a packet and see if old socket is closed"
 # idea: run a UDP4-LISTEN process with range option. Send it one packet from an
 # address outside range and check if two listening sockets are open then
@@ -9159,9 +9587,9 @@ tp=$PORT
 da1="test$N $(date) $RANDOM"
 a1="$LOCALHOST"
 a2="$SECONDADDR"
-#CMD0="$SOCAT $opts UDP4-LISTEN:$tp,bind=$a1,range=$a2/32 PIPE"
-CMD0="$SOCAT $opts UDP4-LISTEN:$tp,range=$a2/32 PIPE"
-CMD1="$SOCAT $opts - UDP-CONNECT:$a1:$tp"
+#CMD0="$TRACE $SOCAT $opts UDP4-LISTEN:$tp,bind=$a1,range=$a2/32 PIPE"
+CMD0="$TRACE $SOCAT $opts UDP4-LISTEN:$tp,range=$a2/32 PIPE"
+CMD1="$TRACE $SOCAT $opts - UDP-CONNECT:$a1:$tp"
 printf "test $F_n $TEST... " $N
 $CMD0 >/dev/null 2>"${te}0" &
 pid1=$!
@@ -9183,6 +9611,7 @@ elif [ $nsocks -ne 1 ]; then
     echo "$CMD1"
     cat "${te}0" "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat "${te}0" "${te}1" "${te}2"; fi
@@ -9198,7 +9627,7 @@ N=$((N+1))
 # the reverse direction
 NAME=IGNOREEOFNOBLOCK
 case "$TESTS" in
-*%functions%*|*%engine%*|*%socket%*|*%ignoreeof%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%socket%*|*%ignoreeof%*|*%$NAME%*)
 TEST="$NAME: ignoreeof does not block other direction"
 # have socat poll in ignoreeof mode. while it waits one second for next check,
 # we send data in the reverse direction and then the total timeout fires.
@@ -9208,7 +9637,7 @@ tf="$td/test$N.stout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts /dev/null,ignoreeof!!- -!!/dev/null"
+CMD0="$TRACE $SOCAT $opts /dev/null,ignoreeof!!- -!!/dev/null"
 printf "test $F_n $TEST... " $N
 (usleep 333333; echo "$da") |$CMD0 >"$tf" 2>"${te}0"
 rc0=$?
@@ -9219,6 +9648,7 @@ if [ $rc0 != 0 ]; then
     cat "${te}0"
     cat "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif echo "$da" |diff - "$tf" >/dev/null; then
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -9228,6 +9658,7 @@ else
     echo "$CMD1"
     cat "${te}0"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi ;; # NUMCOND
 esac
@@ -9237,7 +9668,7 @@ N=$((N+1))
 # test the escape option
 NAME=ESCAPE
 case "$TESTS" in
-*%functions%*|*%engine%*|*%escape%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%escape%*|*%$NAME%*)
 TEST="$NAME: escape character triggers EOF"
 # idea: start socat just echoing input, but apply escape option. send a string
 # containing the escape character and check if the output is truncated
@@ -9246,18 +9677,20 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD="$SOCAT $opts -,escape=27 pipe"
+CMD="$TRACE $SOCAT $opts -,escape=27 pipe"
 printf "test $F_n $TEST... " $N
 $ECHO "$da\n\x1bXYZ" |$CMD >"$tf" 2>"$te"
 if [ $? -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
     $PRINTF "$FAILED: diff:\n"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat $te; fi
@@ -9270,7 +9703,7 @@ N=$((N+1))
 # test the escape option combined with ignoreeof
 NAME=ESCAPE_IGNOREEOF
 case "$TESTS" in
-*%functions%*|*%engine%*|*%ignoreeof%*|*%escape%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%engine%*|*%ignoreeof%*|*%escape%*|*%$NAME%*)
 TEST="$NAME: escape character triggers EOF"
 # idea: start socat just echoing input, but apply escape option. send a string
 # containing the escape character and check if the output is truncated
@@ -9280,7 +9713,7 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD="$SOCAT -T 5 $opts file:$ti,ignoreeof,escape=27!!- pipe"
+CMD="$TRACE $SOCAT -T 5 $opts file:$ti,ignoreeof,escape=27!!- pipe"
 printf "test $F_n $TEST... " $N
 >"$ti"
 $CMD >"$tf" 2>"$te" &
@@ -9291,6 +9724,7 @@ if ! echo "$da" |diff - "$tf" >"$tdiff"; then
     cat "$tdiff"
     cat "$te"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat $te; fi
@@ -9310,7 +9744,7 @@ pf="$(echo "$PF" |tr A-Z a-z)"
 proto="$(echo "$KEYW" |tr A-Z a-z)"
 NAME=${KEYW}SCM_$SCM_TYPE
 case "$TESTS" in
-*%functions%*|*%$pf%*|*%dgram%*|*%udp%*|*%$proto%*|*%recv%*|*%ancillary%*|*%$ROOT%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$pf%*|*%dgram%*|*%udp%*|*%$proto%*|*%recv%*|*%ancillary%*|*%$ROOT%*|*%$NAME%*)
 TEST="$NAME: $KEYW log ancillary message $SCM_TYPE $SCM_NAME"
 # idea: start a socat process with *-RECV:..,... , ev. with ancillary message
 # enabling option and send it a packet, ev. with some option. check the info log
@@ -9342,11 +9776,11 @@ case "X$IPPORT" in
     tra="$(eval echo "$ADDR")"	# resolve $N
     tsa="$tra"
 esac
-CMD0="$SOCAT $opts -d -d -d -u $KEYW-RECV:$tra,reuseaddr,$SCM_RECV -"
-CMD1="$SOCAT $opts -u - $KEYW-SENDTO:$tsa,$SCM_ENABLE"
+CMD0="$TRACE $SOCAT $opts -d -d -d -u $KEYW-RECV:$tra,reuseaddr,$SCM_RECV -"
+CMD1="$TRACE $SOCAT $opts -u - $KEYW-SENDTO:$tsa,$SCM_ENABLE"
 printf "test $F_n $TEST... " $N
 # is this option supported?
-if $SOCAT -hhh |grep "[[:space:]]$SCM_RECV[[:space:]]" >/dev/null; then
+if $TRACE $SOCAT -hhh |grep "[[:space:]]$SCM_RECV[[:space:]]" >/dev/null; then
 $CMD0 >"$tf" 2>"${te}0" &
 pid0="$!"
 wait${proto}port $tra 1
@@ -9367,7 +9801,7 @@ if [ "$SCM_VALUE" = "timestamp" ]; then
     SCM_VALUE="$(date '+%a %b %e %H:%M:.. %Y')"
 fi
 if [ "$rc1" -ne 0 ]; then
-    $PRINTF "$NO_RESULT: $SOCAT:\n"
+    $PRINTF "$NO_RESULT: $TRACE $SOCAT:\n"
     echo "$CMD0 &"
     echo "$CMD1"
     grep " $LEVELS " "${te}0"
@@ -9375,21 +9809,23 @@ if [ "$rc1" -ne 0 ]; then
     numCANT=$((numCANT+1))
 elif ! grep "ancillary message: $SCM_TYPE: $SCM_NAME=" ${te}0 >/dev/null; then
     $PRINTF "$FAILED\n"
+    echo "variable $SCM_TYPE: $SCM_NAME not set"
     echo "$CMD0 &"
     echo "$CMD1"
     grep " $LEVELS " "${te}0"
     grep " $LEVELS " "${te}1"
-    echo "variable $SCM_TYPE: $SCM_NAME not set"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! grep "ancillary message: $SCM_TYPE: $SCM_NAME=$SCM_VALUE" ${te}0 >/dev/null; then
     $PRINTF "$FAILED\n"
+    badval="$(grep "ancillary message: $SCM_TYPE: $SCM_NAME" ${te}0 |sed 's/.*=//g')"
+    echo "variable $SCM_TYPE: $SCM_NAME has value \"$badval\" instead of pattern \"$SCM_VALUE\"" >&2
     echo "$CMD0 &"
     echo "$CMD1"
     grep " $LEVELS " "${te}0"
     grep " $LEVELS " "${te}1"
-    badval="$(grep "ancillary message: $SCM_TYPE: $SCM_NAME" ${te}0 |sed 's/.*=//g')"
-    echo "variable $SCM_TYPE: $SCM_NAME has value \"$badval\" instead of \"$SCM_VALUE\""
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then
@@ -9449,8 +9885,8 @@ if [ -z "$KEYW" ] || [[ "$KEYW" == \#* ]]; then continue; fi
 test_proto="$(echo "$KEYW" |tr A-Z a-z)"
 NAME=${KEYW}LISTENENV
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$test_proto%*|*%envvar%*|*%$NAME%*)
-TEST="$NAME: $KEYW-LISTEN fills environment variables with socket addresses"
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$test_proto%*|*%envvar%*|*%$NAME%*)
+TEST="$NAME: $KEYW-LISTEN sets environment variables with socket addresses"
 # have a server accepting a connection and invoking some shell code. The shell
 # code extracts and prints the SOCAT related environment vars.
 # outside code then checks if the environment contains the variables correctly
@@ -9485,9 +9921,9 @@ tcp="$TEST_PEERPORT"	# test client port
 if [ "$tcp" != ',' ]; then
     tca="$tca:$tcp"
 fi
-#CMD0="$SOCAT $opts -u $KEYW-LISTEN:$tsa1 system:\"export -p\""
-CMD0="$SOCAT $opts -u $KEYW-LISTEN:$tsa1 system:\"echo SOCAT_SOCKADDR=\\\$SOCAT_SOCKADDR; echo SOCAT_PEERADDR=\\\$SOCAT_PEERADDR; echo SOCAT_SOCKPORT=\\\$SOCAT_SOCKPORT; echo SOCAT_PEERPORT=\\\$SOCAT_PEERPORT; sleep 1\""
-CMD1="$SOCAT $opts -u - $KEYW-CONNECT:$tsa,bind=$tca"
+#CMD0="$TRACE $SOCAT $opts -u $KEYW-LISTEN:$tsa1 SYSTEM:\"export -p\""
+CMD0="$TRACE $SOCAT $opts -u -lpsocat $KEYW-LISTEN:$tsa1 SYSTEM:\"echo SOCAT_SOCKADDR=\\\$SOCAT_SOCKADDR; echo SOCAT_PEERADDR=\\\$SOCAT_PEERADDR; echo SOCAT_SOCKPORT=\\\$SOCAT_SOCKPORT; echo SOCAT_PEERPORT=\\\$SOCAT_PEERPORT; sleep 1\""
+CMD1="$TRACE $SOCAT $opts -u - $KEYW-CONNECT:$tsa,bind=$tca"
 printf "test $F_n $TEST... " $N
 eval "$CMD0 2>\"${te}0\" >\"$tf\" &"
 pid0=$!
@@ -9523,7 +9959,10 @@ else
     cat "${te}0"
     echo "$CMD1"
     cat "${te}1"
+    echo -e "SOCAT_SOCKADDR=$TEST_SOCKADDR\nSOCAT_PEERADDR=$TEST_PEERADDR\nSOCAT_SOCKPORT=$TEST_SOCKPORT\nSOCAT_PEERPORT=$TEST_PEERPORT" |
+    diff - "${tf}"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND, feats
  ;;
@@ -9532,10 +9971,10 @@ N=$((N+1))
 #set +xv
 #
 done <<<"
-TCP4  TCP  $LOCALHOST                                $SECONDADDR                               $PORT       $((PORT+1))
+TCP4  TCP  127.0.0.1                                 $SECONDADDR                               $PORT       $((PORT+1))
 TCP6  IP6  [0000:0000:0000:0000:0000:0000:0000:0001] [0000:0000:0000:0000:0000:0000:0000:0001] $((PORT+2)) $((PORT+3))
 UDP6  IP6  [0000:0000:0000:0000:0000:0000:0000:0001] [0000:0000:0000:0000:0000:0000:0000:0001] $((PORT+6)) $((PORT+7))
-SCTP4 SCTP $LOCALHOST                                $SECONDADDR                               $((PORT+8)) $((PORT+9))
+SCTP4 SCTP 127.0.0.1                                 $SECONDADDR                               $((PORT+8)) $((PORT+9))
 SCTP6 SCTP [0000:0000:0000:0000:0000:0000:0000:0001] [0000:0000:0000:0000:0000:0000:0000:0001] $((PORT+10)) $((PORT+11))
 UNIX  UNIX $td/test\$N.server                        $td/test\$N.client                        ,           ,
 "
@@ -9552,9 +9991,9 @@ pf="$(echo "$PF" |tr A-Z a-z)"
 proto="$(echo "$KEYW" |tr A-Z a-z)"
 NAME=${KEYW}ENV_$SCM_ENVNAME
 case "$TESTS" in
-*%functions%*|*%$pf%*|*%dgram%*|*%udp%*|*%$proto%*|*%recv%*|*%ancillary%*|*%envvar%*|*%$ROOT%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%$pf%*|*%dgram%*|*%udp%*|*%$proto%*|*%recv%*|*%ancillary%*|*%envvar%*|*%$ROOT%*|*%$NAME%*)
 #set -vx
-TEST="$NAME: $KEYW ancillary message brings $SCM_ENVNAME into environment"
+TEST="$NAME: $KEYW ancillary message sets env SOCAT_$SCM_ENVNAME"
 # idea: start a socat process with *-RECVFROM:..,... , ev. with ancillary
 # message  enabling option and send it a packet, ev. with some option. write
 # the resulting environment to a file and check its contents for the
@@ -9582,9 +10021,9 @@ case "X$IPPORT" in
     tra="$(eval echo "$ADDR")"	# resolve $N
     tsa="$tra"
 esac
-#CMD0="$SOCAT $opts -u $KEYW-RECVFROM:$tra,reuseaddr,$SCM_RECV system:\"export -p\""
-CMD0="$SOCAT $opts -u $KEYW-RECVFROM:$tra,reuseaddr,$SCM_RECV system:\"echo \\\$SOCAT_$SCM_ENVNAME\""
-CMD1="$SOCAT $opts -u - $KEYW-SENDTO:$tsa,$SCM_ENABLE"
+#CMD0="$TRACE $SOCAT $opts -u $KEYW-RECVFROM:$tra,reuseaddr,$SCM_RECV SYSTEM:\"export -p\""
+CMD0="$TRACE $SOCAT $opts -u -lpsocat $KEYW-RECVFROM:$tra,reuseaddr,$SCM_RECV SYSTEM:\"echo \\\$SOCAT_$SCM_ENVNAME\""
+CMD1="$TRACE $SOCAT $opts -u - $KEYW-SENDTO:$tsa,$SCM_ENABLE"
 printf "test $F_n $TEST... " $N
 # is this option supported?
 if $SOCAT -hhh |grep "[[:space:]]$SCM_RECV[[:space:]]" >/dev/null; then
@@ -9597,7 +10036,6 @@ waitfile "$tf" 2
 #i=0; while [ ! -s "${te}0" -a "$i" -lt 10 ]; do  usleep 100000; i=$((i+1));  done
 kill "$pid0" 2>/dev/null; wait
 # do not show more messages than requested
-#set -vx
 if [ "$SCM_VALUE" = "timestamp" ]; then
     SCM_VALUE="$(date '+%a %b %e %H:%M:.. %Y'), ...... usecs"
 fi
@@ -9609,7 +10047,7 @@ if [ "$rc1" -ne 0 ]; then
     cat "${te}1"
     numCANT=$((numCANT+1))
 #elif ! egrep "^export SOCAT_$SCM_ENVNAME=[\"']?$SCM_VALUE[\"']?\$" ${tf} >/dev/null; then
-#elif ! eval echo "$SOCAT_\$SCM_VALUE" |diff - "${tf}" >/dev/null; then
+#elif ! eval echo "$TRACE $SOCAT_\$SCM_VALUE" |diff - "${tf}" >/dev/null; then
 elif ! expr "$(cat "$tf")" : "$(eval echo "\$SCM_VALUE")" >/dev/null; then
     $PRINTF "$FAILED\n"
     echo "$CMD0 &"
@@ -9617,6 +10055,7 @@ elif ! expr "$(cat "$tf")" : "$(eval echo "\$SCM_VALUE")" >/dev/null; then
     cat "${te}0"
     cat "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then
@@ -9624,7 +10063,6 @@ else
     fi
     numOK=$((numOK+1))
 fi
-#set +vx
 else # option is not supported
     $PRINTF "${YELLOW}$SCM_RECV not available${NORMAL}\n"
     numCANT=$((numCANT+1))
@@ -9665,7 +10103,7 @@ IP6  IP6  [::1]     PROTO ipv6-tclass=0xaa     ipv6-recvtclass   IPV6_TCLASS    
 # test the SOCKET-CONNECT address (against TCP4-LISTEN)
 NAME=SOCKET_CONNECT_TCP4
 case "$TESTS" in
-*%functions%*|*%generic%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%generic%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: socket connect with TCP/IPv4"
 # start a TCP4-LISTEN process that echoes data, and send test data using
 # SOCKET-CONNECT, selecting TCP/IPv4. The sent data should be returned.
@@ -9680,8 +10118,8 @@ ts1a="7f000001" # "127.0.0.1"
 ts1="x${ts1p}${ts1a}x0000000000000000"
 ts1b=$(printf "%04x" $PORT); PORT=$((PORT+1))
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts TCP4-LISTEN:$ts0p,reuseaddr,bind=$ts0a PIPE"
-CMD1="$SOCAT $opts - SOCKET-CONNECT:2:6:$ts1,bind=x${ts1b}00000000x0000000000000000"
+CMD0="$TRACE $SOCAT $opts TCP4-LISTEN:$ts0p,reuseaddr,bind=$ts0a PIPE"
+CMD1="$TRACE $SOCAT $opts - SOCKET-CONNECT:2:6:$ts1,bind=x${ts1b}00000000x0000000000000000"
 printf "test $F_n $TEST... " $N
 $CMD0 2>"${te}0" &
 pid0="$!"
@@ -9690,12 +10128,13 @@ echo "$da" |$CMD1 >>"$tf" 2>>"${te}1"
 rc1="$?"
 kill "$pid0" 2>/dev/null; wait;
 if [ "$rc1" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD0 &"
    cat "${te}0"
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
@@ -9704,6 +10143,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -9720,7 +10160,7 @@ PF_INET6="$($PROCAN -c |grep "^#define[[:space:]]*PF_INET6[[:space:]]" |cut -d' 
 # test the SOCKET-CONNECT address (against TCP6-LISTEN)
 NAME=SOCKET_CONNECT_TCP6
 case "$TESTS" in
-*%functions%*|*%generic%*|*%tcp6%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%generic%*|*%tcp6%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: socket connect with TCP/IPv6"
 if ! eval $NUMCOND; then :;
 elif ! testaddrs tcp ip6 >/dev/null || ! runsip6 >/dev/null; then
@@ -9739,8 +10179,8 @@ ts1a="00000000000000000000000000000001" # "[::1]"
 ts1="x${ts1p}x00000000x${ts1a}x00000000"
 ts1b=$(printf "%04x" $PORT); PORT=$((PORT+1))
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts TCP6-LISTEN:$ts0p,reuseaddr,bind=$ts0a PIPE"
-CMD1="$SOCAT $opts - SOCKET-CONNECT:$PF_INET6:6:$ts1,bind=x${ts1b}x00000000x00000000000000000000000000000000x00000000"
+CMD0="$TRACE $SOCAT $opts TCP6-LISTEN:$ts0p,reuseaddr,bind=$ts0a PIPE"
+CMD1="$TRACE $SOCAT $opts - SOCKET-CONNECT:$PF_INET6:6:$ts1,bind=x${ts1b}x00000000x00000000000000000000000000000000x00000000"
 printf "test $F_n $TEST... " $N
 $CMD0 2>"${te}0" &
 pid0="$!"
@@ -9749,12 +10189,13 @@ echo "$da" |$CMD1 >>"$tf" 2>>"${te}1"
 rc1="$?"
 kill "$pid0" 2>/dev/null; wait;
 if [ "$rc1" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD0 &"
    cat "${te}0"
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
@@ -9763,6 +10204,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -9776,7 +10218,7 @@ N=$((N+1))
 # test the SOCKET-CONNECT address (against UNIX-LISTEN)
 NAME=SOCKET_CONNECT_UNIX
 case "$TESTS" in
-*%functions%*|*%generic%*|*%unix%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%generic%*|*%unix%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: socket connect with UNIX domain"
 # start a UNIX-LISTEN process that echoes data, and send test data using
 # SOCKET-CONNECT, selecting UNIX socket. The sent data should be returned.
@@ -9787,8 +10229,8 @@ tdiff="$td/test$N.diff"
 ts0="$td/test$N.server"
 ts1="$td/test$N.client"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts UNIX-LISTEN:$ts0,reuseaddr PIPE"
-CMD1="$SOCAT $opts - SOCKET-CONNECT:1:0:\\\"$ts0\\\0\\\",bind=\\\"$ts1\\\0\\\""
+CMD0="$TRACE $SOCAT $opts UNIX-LISTEN:$ts0,reuseaddr PIPE"
+CMD1="$TRACE $SOCAT $opts - SOCKET-CONNECT:1:0:\\\"$ts0\\\0\\\",bind=\\\"$ts1\\\0\\\""
 printf "test $F_n $TEST... " $N
 $CMD0 2>"${te}0" &
 pid0="$!"
@@ -9797,12 +10239,13 @@ echo "$da" |$CMD1 >>"$tf" 2>>"${te}1"
 rc1="$?"
 kill "$pid0" 2>/dev/null; wait;
 if [ "$rc1" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD0 &"
    cat "${te}0"
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
@@ -9811,6 +10254,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -9823,7 +10267,7 @@ N=$((N+1))
 # test the SOCKET-LISTEN address (with TCP4-CONNECT)
 NAME=SOCKET_LISTEN
 case "$TESTS" in
-*%functions%*|*%generic%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%generic%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: socket recvfrom with TCP/IPv4"
 # start a SOCKET-LISTEN process that uses TCP/IPv4 and echoes data, and
 # send test data using TCP4-CONNECT. The sent data should be returned.
@@ -9839,8 +10283,8 @@ ts0="x${ts0p}${ts0a}x0000000000000000"
 ts1b=$PORT; PORT=$((PORT+1))
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts SOCKET-LISTEN:2:6:$ts0,reuseaddr PIPE"
-CMD1="$SOCAT $opts - TCP4-CONNECT:$ts1,bind=:$ts1b"
+CMD0="$TRACE $SOCAT $opts SOCKET-LISTEN:2:6:$ts0,reuseaddr PIPE"
+CMD1="$TRACE $SOCAT $opts - TCP4-CONNECT:$ts1,bind=:$ts1b"
 printf "test $F_n $TEST... " $N
 $CMD0 2>"${te}0" &
 pid0="$!"
@@ -9850,12 +10294,13 @@ echo "$da" |$CMD1 >>"$tf" 2>>"${te}1"
 rc1="$?"
 kill "$pid0" 2>/dev/null; wait;
 if [ "$rc1" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD0 &"
    cat "${te}0"
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
@@ -9864,6 +10309,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -9879,7 +10325,7 @@ SOCK_DGRAM="$($PROCAN -c |grep "^#define[[:space:]]*SOCK_DGRAM[[:space:]]" |cut 
 # test the SOCKET-SENDTO address (against UDP4-RECVFROM)
 NAME=SOCKET_SENDTO
 case "$TESTS" in
-*%functions%*|*%generic%*|*%socket%*|*%ip4%*|*%udp%*|*%dgram%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%generic%*|*%socket%*|*%ip4%*|*%udp%*|*%dgram%*|*%$NAME%*)
 TEST="$NAME: socket sendto with UDP/IPv4"
 # start a UDP4-RECVFROM process that echoes data, and send test data using
 # SOCKET-SENDTO, selecting UDP/IPv4. The sent data should be returned.
@@ -9894,8 +10340,8 @@ ts1a="7f000001" # "127.0.0.1"
 ts1="x${ts1p}${ts1a}x0000000000000000"
 ts1b=$(printf "%04x" $PORT); PORT=$((PORT+1))
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts UDP4-RECVFROM:$ts0p,reuseaddr,bind=$ts0a PIPE"
-CMD1="$SOCAT $opts - SOCKET-SENDTO:2:$SOCK_DGRAM:17:$ts1,bind=x${ts1b}x00000000x0000000000000000"
+CMD0="$TRACE $SOCAT $opts UDP4-RECVFROM:$ts0p,reuseaddr,bind=$ts0a PIPE"
+CMD1="$TRACE $SOCAT $opts - SOCKET-SENDTO:2:$SOCK_DGRAM:17:$ts1,bind=x${ts1b}x00000000x0000000000000000"
 printf "test $F_n $TEST... " $N
 $CMD0 2>"${te}0" &
 pid0="$!"
@@ -9904,12 +10350,13 @@ echo "$da" |$CMD1 >>"$tf" 2>>"${te}1"
 rc1="$?"
 kill "$pid0" 2>/dev/null; wait;
 if [ "$rc1" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD0 &"
    cat "${te}0"
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
@@ -9918,6 +10365,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -9931,7 +10379,7 @@ N=$((N+1))
 # test the SOCKET-RECVFROM address (with UDP4-SENDTO)
 NAME=SOCKET_RECVFROM
 case "$TESTS" in
-*%functions%*|*%generic%*|*%socket%*|*%ip4%*|*%udp%*|*%dgram%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%generic%*|*%socket%*|*%ip4%*|*%udp%*|*%dgram%*|*%$NAME%*)
 TEST="$NAME: socket recvfrom with UDP/IPv4"
 # start a SOCKET-RECVFROM process that uses UDP/IPv4 and echoes data, and
 # send test data using UDP4-SENDTO. The sent data should be returned.
@@ -9947,8 +10395,8 @@ ts0="x${ts0p}${ts0a}x0000000000000000"
 ts1b=$PORT; PORT=$((PORT+1))
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts SOCKET-RECVFROM:2:$SOCK_DGRAM:17:$ts0,reuseaddr PIPE"
-CMD1="$SOCAT $opts - UDP4-SENDTO:$ts1,bind=:$ts1b"
+CMD0="$TRACE $SOCAT $opts SOCKET-RECVFROM:2:$SOCK_DGRAM:17:$ts0,reuseaddr PIPE"
+CMD1="$TRACE $SOCAT $opts - UDP4-SENDTO:$ts1,bind=:$ts1b"
 printf "test $F_n $TEST... " $N
 $CMD0 2>"${te}0" &
 pid0="$!"
@@ -9957,12 +10405,13 @@ echo "$da" |$CMD1 >>"$tf" 2>>"${te}1"
 rc1="$?"
 kill "$pid0" 2>/dev/null; wait;
 if [ "$rc1" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD0 &"
    cat "${te}0"
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
@@ -9971,6 +10420,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -9985,7 +10435,7 @@ N=$((N+1))
 # test the SOCKET-RECV address (with UDP4-SENDTO)
 NAME=SOCKET_RECV
 case "$TESTS" in
-*%functions%*|*%generic%*|*%socket%*|*%ip4%*|*%udp%*|*%dgram%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%generic%*|*%socket%*|*%ip4%*|*%udp%*|*%dgram%*|*%$NAME%*)
 TEST="$NAME: socket recv with UDP/IPv4"
 # start a SOCKET-RECV process that uses UPD/IPv4 and writes received data to file, and
 # send test data using UDP4-SENDTO.
@@ -10001,8 +10451,8 @@ ts0="x${ts0p}${ts0a}x0000000000000000"
 ts1b=$PORT; PORT=$((PORT+1))
 ts1="$ts1a:$ts1p"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts -u SOCKET-RECV:2:$SOCK_DGRAM:17:$ts0,reuseaddr -"
-CMD1="$SOCAT $opts -u - UDP4-SENDTO:$ts1,bind=:$ts1b"
+CMD0="$TRACE $SOCAT $opts -u SOCKET-RECV:2:$SOCK_DGRAM:17:$ts0,reuseaddr -"
+CMD1="$TRACE $SOCAT $opts -u - UDP4-SENDTO:$ts1,bind=:$ts1b"
 printf "test $F_n $TEST... " $N
 $CMD0 2>"${te}0" >"$tf" &
 pid0="$!"
@@ -10012,12 +10462,13 @@ rc1="$?"
 sleep 1
 kill "$pid0" 2>/dev/null; wait;
 if [ "$rc1" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD0 &"
    cat "${te}0"
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
@@ -10026,6 +10477,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -10039,7 +10491,7 @@ N=$((N+1))
 # test SOCKET-DATAGRAM (with UDP4-DATAGRAM)
 NAME=SOCKET_DATAGRAM
 case "$TESTS" in
-*%functions%*|*%generic%*|*%socket%*|*%ip4%*|*%udp%*|*%dgram%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%generic%*|*%socket%*|*%ip4%*|*%udp%*|*%dgram%*|*%$NAME%*)
 TEST="$NAME: socket datagram via UDP/IPv4"
 # start a UDP4-DATAGRAM process that echoes data, and send test data using
 # SOCKET-DATAGRAM, selecting UDP/IPv4. The sent data should be returned.
@@ -10056,8 +10508,8 @@ ts0b=$(printf "%04x" $ts0p)
 ts1b=$(printf "%04x" $ts1p)
 ts1="x${ts0b}${ts1a}x0000000000000000"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts UDP4-DATAGRAM:$ts0a:$ts1p,bind=:$ts0p,reuseaddr PIPE"
-CMD1="$SOCAT $opts - SOCKET-DATAGRAM:2:$SOCK_DGRAM:17:$ts1,bind=x${ts1b}x00000000x0000000000000000"
+CMD0="$TRACE $SOCAT $opts UDP4-DATAGRAM:$ts0a:$ts1p,bind=:$ts0p,reuseaddr PIPE"
+CMD1="$TRACE $SOCAT $opts - SOCKET-DATAGRAM:2:$SOCK_DGRAM:17:$ts1,bind=x${ts1b}x00000000x0000000000000000"
 printf "test $F_n $TEST... " $N
 $CMD0 2>"${te}0" &
 pid0="$!"
@@ -10066,12 +10518,13 @@ echo "$da" |$CMD1 2>>"${te}1" >"$tf"
 rc1="$?"
 kill "$pid0" 2>/dev/null; wait;
 if [ "$rc1" -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD0 &"
    cat "${te}0"
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
@@ -10080,6 +10533,7 @@ elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    echo "$CMD1"
    cat "${te}1"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat $te; fi
@@ -10092,7 +10546,7 @@ N=$((N+1))
 
 NAME=SOCKETRANGEMASK
 case "$TESTS" in
-*%functions%*|*%security%*|*%generic%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%socket%*|*%range%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%security%*|*%generic%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%socket%*|*%range%*|*%$NAME%*)
 TEST="$NAME: security of generic socket-listen with RANGE option"
 if ! eval $NUMCOND; then :;
 elif [ -z "$SECONDADDR" ]; then
@@ -10113,7 +10567,7 @@ TIOCEXCL="$($PROCAN -c |grep "^#define[[:space:]]*TIOCEXCL[[:space:]]" |cut -d' 
 # test the generic ioctl-void option
 NAME=IOCTL_VOID
 case "$TESTS" in
-*%functions%*|*%pty%*|*%generic%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%pty%*|*%generic%*|*%$NAME%*)
 TEST="$NAME: test the ioctl-void option"
 # there are not many ioctls that apply to non global resources and do not
 # require root. TIOCEXCL seems to fit:
@@ -10132,9 +10586,9 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts PTY,LINK=$tp pipe"
-CMD1="$SOCAT $opts - file:$tp,ioctl-void=$TIOCEXCL,raw,echo=0"
-CMD2="$SOCAT $opts - file:$tp,raw,echo=0"
+CMD0="$TRACE $SOCAT $opts PTY,LINK=$tp pipe"
+CMD1="$TRACE $SOCAT $opts - file:$tp,ioctl-void=$TIOCEXCL,raw,echo=0"
+CMD2="$TRACE $SOCAT $opts - file:$tp,raw,echo=0"
 printf "test $F_n $TEST... " $N
 $CMD0 >/dev/null 2>"${te}0" &
 pid0=$!
@@ -10152,12 +10606,13 @@ if ! echo "$da" |diff - "$tf" >/dev/null; then
     echo "$da" |diff - "$tf"
     numCANT=$((numCANT+1))
 elif [ $rc2 -eq 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD0 &"
     echo "$CMD1"
     echo "$CMD2"
     cat "${te}0" "${te}1" "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     if [ -n "$debug" ]; then cat "${te}0" "${te}1" "${te}2"; fi
@@ -10173,9 +10628,11 @@ SOL_SOCKET="$($PROCAN -c |grep "^#define[[:space:]]*SOL_SOCKET[[:space:]]" |cut 
 SO_REUSEADDR="$($PROCAN -c |grep "^#define[[:space:]]*SO_REUSEADDR[[:space:]]" |cut -d' ' -f3)"
 
 # test the generic setsockopt-int option
+if false; then
+# this test no longer works due to fix for options on listening sockets
 NAME=SETSOCKOPT_INT
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%tcp%*|*%generic%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%tcp%*|*%generic%*|*%$NAME%*)
 TEST="$NAME: test the setsockopt-int option"
 # there are not many socket options that apply to non global resources, do not
 # require root, do not require a network connection, and can easily be
@@ -10197,8 +10654,8 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts TCP4-L:$tp,setsockopt-int=$SOL_SOCKET:$SO_REUSEADDR:1 PIPE"
-CMD1="$SOCAT $opts - TCP:localhost:$tp"
+CMD0="$TRACE $SOCAT $opts TCP4-L:$tp,setsockopt-int=$SOL_SOCKET:$SO_REUSEADDR:1 PIPE"
+CMD1="$TRACE $SOCAT $opts - TCP:localhost:$tp"
 CMD2="$CMD0"
 CMD3="$CMD1"
 printf "test $F_n $TEST... " $N
@@ -10220,13 +10677,14 @@ if ! echo "$da" |diff - "$tf"; then
     echo "$CMD1"
     numCANT=$((numCANT+1))
 elif [ $rc3 -ne 0 ]; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD3"
     cat "${te}2" "${te}3"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "${tf}3"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD3"
     echo "$da" |diff - "${tf}3"
@@ -10241,11 +10699,13 @@ fi # NUMCOND, SO_REUSEADDR
 esac
 PORT=$((PORT+1))
 N=$((N+1))
+#
+fi
 
 
 NAME=SCTP4STREAM
 case "$TESTS" in
-*%functions%*|*%ip4%*|*%ipapp%*|*%sctp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%sctp%*|*%$NAME%*)
 TEST="$NAME: echo via connection to SCTP V4 socket"
 PORT="$((PORT+1))"
 if ! eval $NUMCOND; then :;
@@ -10264,8 +10724,8 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="127.0.0.1:$tsl"
 da=$(date)
-CMD1="$SOCAT $opts SCTP4-LISTEN:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout SCTP4:$ts"
+CMD1="$TRACE $SOCAT $opts SCTP4-LISTEN:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout SCTP4:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid1=$!
@@ -10273,16 +10733,18 @@ waitsctp4port $tsl 1
 # SCTP does not seem to support half close, so we give it 1s to finish
 (echo "$da"; sleep 1) |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    cat "${te}1"
    echo "$CMD2"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -10298,7 +10760,7 @@ N=$((N+1))
 
 NAME=SCTP6STREAM
 case "$TESTS" in
-*%functions%*|*%ip6%*|*%ipapp%*|*%sctp%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%ip6%*|*%ipapp%*|*%sctp%*|*%$NAME%*)
 TEST="$NAME: echo via connection to SCTP V6 socket"
 PORT="$((PORT+1))"
 if ! eval $NUMCOND; then :;
@@ -10315,8 +10777,8 @@ tdiff="$td/test$N.diff"
 tsl=$PORT
 ts="[::1]:$tsl"
 da=$(date)
-CMD1="$SOCAT $opts SCTP6-listen:$tsl,reuseaddr PIPE"
-CMD2="$SOCAT $opts stdin!!stdout SCTP6:$ts"
+CMD1="$TRACE $SOCAT $opts SCTP6-listen:$tsl,reuseaddr PIPE"
+CMD2="$TRACE $SOCAT $opts stdin!!stdout SCTP6:$ts"
 printf "test $F_n $TEST... " $N
 $CMD1 >"$tf" 2>"${te}1" &
 pid=$!	# background process id
@@ -10324,16 +10786,18 @@ waitsctp6port $tsl 1
 # SCTP does not seem to support half close, so we let it 1s to finish
 (echo "$da"; sleep 1) |$CMD2 >>"$tf" 2>>"${te}2"
 if [ $? -ne 0 ]; then
-   $PRINTF "$FAILED: $SOCAT:\n"
+   $PRINTF "$FAILED: $TRACE $SOCAT:\n"
    echo "$CMD1 &"
    cat "${te}1"
    echo "$CMD2"
    cat "${te}2"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
    $PRINTF "$FAILED: diff:\n"
    cat "$tdiff"
    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -10351,8 +10815,8 @@ N=$((N+1))
 # performed a renegotiation. Test if this is fixed.
 NAME=OPENSSLRENEG1
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%openssl%*|*%socket%*|*%$NAME%*)
-TEST="$NAME: OpenSSL connections survives renogotiation"
+*%$N%*|*%functions%*|*%bugs%*|*%openssl%*|*%socket%*|*%$NAME%*)
+TEST="$NAME: OpenSSL connections survive renogotiation"
 # connect with s_client to socat ssl-l; force a renog, then transfer data. When
 # data is passed the test succeeded
 if ! eval $NUMCOND; then :;
@@ -10366,11 +10830,12 @@ elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
     $PRINTF "test $F_n $TEST... ${YELLOW}TCP/IPv4 not available${NORMAL}\n" $N
     numCANT=$((numCANT+1))
 else
+gentestcert testsrv
 tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,cert=testsrv.crt,key=testsrv.key,verify=0 PIPE"
+CMD0="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,cert=testsrv.crt,key=testsrv.key,verify=0 PIPE"
 CMD1="openssl s_client -port $PORT -verify 0"
 printf "test $F_n $TEST... " $N
 $CMD0 >/dev/null 2>"${te}0" &
@@ -10390,6 +10855,7 @@ else
 #    cat "${te}1"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -10403,7 +10869,7 @@ N=$((N+1))
 # leave socat in a blocking ssl-read state. Test if this has been fixed.
 NAME=OPENSSLRENEG2
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%openssl%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%openssl%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: OpenSSL connections do not block after renogotiation"
 # connect with s_client to socat ssl-l; force a renog, then transfer data from
 # socat to the peer. When data is passed this means that the former ssl read no
@@ -10419,11 +10885,12 @@ elif ! testaddrs tcp ip4 >/dev/null || ! runsip4 >/dev/null; then
     $PRINTF "test $F_n $TEST... ${YELLOW}TCP/IPv4 not available${NORMAL}\n" $N
     numCANT=$((numCANT+1))
 else
+gentestcert testsrv
 tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,cert=testsrv.crt,key=testsrv.key,verify=0 SYSTEM:\"sleep 1; echo \\\\\\\"\\\"$da\\\"\\\\\\\"; sleep 1\"!!STDIO"
+CMD0="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,cert=testsrv.crt,key=testsrv.key,verify=0 SYSTEM:\"sleep 1; echo \\\\\\\"\\\"$da\\\"\\\\\\\"; sleep 1\"!!STDIO"
 CMD1="openssl s_client -port $PORT -verify 0"
 printf "test $F_n $TEST... " $N
 eval "$CMD0 >/dev/null 2>\"${te}0\" &"
@@ -10443,6 +10910,7 @@ else
 #    cat "${te}1"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -10456,7 +10924,7 @@ N=$((N+1))
 # than 512 bytes.
 NAME=HOSTNAMEOVFL
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%security%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%security%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: stack overflow on overly long host name"
 # provide a long host name to TCP-CONNECT and check socats exit code
 if ! eval $NUMCOND; then :; else
@@ -10467,7 +10935,7 @@ da="test$N $(date) $RANDOM"
 # prepare long data - perl might not be installed
 rm -f "$td/test$N.dat"
 i=0; while [ $i -lt 64 ]; do  echo -n "AAAAAAAAAAAAAAAA" >>"$td/test$N.dat"; i=$((i+1)); done
-CMD0="$SOCAT $opts TCP-CONNECT:$(cat "$td/test$N.dat"):$PORT STDIO"
+CMD0="$TRACE $SOCAT $opts TCP-CONNECT:$(cat "$td/test$N.dat"):$PORT STDIO"
 printf "test $F_n $TEST... " $N
 $CMD0 </dev/null 1>&0 2>"${te}0"
 rc0=$?
@@ -10479,6 +10947,7 @@ else
     echo "$CMD0"
     cat "${te}0"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -10491,7 +10960,7 @@ N=$((N+1))
 # than 512 bytes.
 NAME=FILENAMEOVFL
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%security%*|*%openssl%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%security%*|*%openssl%*|*%$NAME%*)
 TEST="$NAME: stack overflow on overly long file name"
 # provide a 600 bytes long key file option to SSL-CONNECT and check socats exit code
 if ! eval $NUMCOND; then :; else
@@ -10500,7 +10969,7 @@ te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
 i=0; while [ $i -lt 64 ]; do  echo -n "AAAAAAAAAAAAAAAA" >>"$td/test$N.dat"; i=$((i+1)); done
-CMD0="$SOCAT $opts OPENSSL:localhost:$PORT,key=$(cat "$td/test$N.dat") STDIO"
+CMD0="$TRACE $SOCAT $opts OPENSSL:localhost:$PORT,key=$(cat "$td/test$N.dat") STDIO"
 printf "test $F_n $TEST... " $N
 $CMD0 </dev/null 1>&0 2>"${te}0"
 rc0=$?
@@ -10512,6 +10981,7 @@ else
     echo "$CMD0"
     cat "${te}0"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -10524,7 +10994,7 @@ N=$((N+1))
 # domain socket with GOPEN
 NAME=GOPEN_UNIX_CRASH
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%gopen%*|*%unix%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%gopen%*|*%unix%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: check crash when connecting to a unix domain socket using address GOPEN"
 # a unix domain server is started in background. the check process connects to
 # its socket. when this process crashes or issues a warning the bug is present.
@@ -10537,8 +11007,8 @@ te="$td/test$N.stderr"
 ts="$td/test$N.sock"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts UNIX-LISTEN:$ts PIPE"
-CMD1="$SOCAT $opts -d - GOPEN:$ts"
+CMD0="$TRACE $SOCAT $opts UNIX-LISTEN:$ts PIPE"
+CMD1="$TRACE $SOCAT $opts -d - GOPEN:$ts"
 printf "test $F_n $TEST... " $N
 $CMD0 >/dev/null 2>"${te}0" </dev/null &
 pid0=$!
@@ -10553,6 +11023,7 @@ if [ $rc1 -ne 0 ]; then
     cat "${te}0"
     cat "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif grep -q ' W ' "${te}1"; then
     $PRINTF "$FAILED\n"
     echo "$CMD0 &"
@@ -10560,6 +11031,7 @@ elif grep -q ' W ' "${te}1"; then
     cat "${te}0"
     cat "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif  ! echo "$da" |diff - ${tf}1 >"$tdiff"; then
     $PRINTF "$FAILED\n"
     echo "$CMD0 &"
@@ -10568,6 +11040,7 @@ elif  ! echo "$da" |diff - ${tf}1 >"$tdiff"; then
     cat "${te}1"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -10581,7 +11054,7 @@ N=$((N+1))
 # test if socat keeps an existing file where it wanted to create a UNIX socket
 NAME=UNIXLISTEN_KEEPFILE
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%unix%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%unix%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: socat keeps an existing file where it wanted to create a UNIX socket"
 # we create a file and start socat with UNIX-LISTEN on this file. expected
 # behaviour: socat exits immediately with error, but keeps the file
@@ -10589,7 +11062,7 @@ TEST="$NAME: socat keeps an existing file where it wanted to create a UNIX socke
 if ! eval $NUMCOND; then :; else
 tf="$td/test$N.file"
 te="$td/test$N.stderr"
-CMD0="$SOCAT $opts -u UNIX-LISTEN:$tf /dev/null"
+CMD0="$TRACE $SOCAT $opts -u UNIX-LISTEN:$tf /dev/null"
 printf "test $F_n $TEST... " $N
 rm -f "$tf"; touch "$tf"
 $CMD0 >/dev/null 2>"${te}0"
@@ -10602,6 +11075,7 @@ else
     echo "$CMD0"
     cat "${te}0"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -10612,7 +11086,7 @@ N=$((N+1))
 # PTY address allowed to sepcify address parameters but ignored them
 NAME=PTY_VOIDARG
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%pty%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%pty%*|*%$NAME%*)
 TEST="$NAME: check if address params of PTY produce error"
 # invoke socat with address PTY and some param; expect an error
 if ! eval $NUMCOND; then :; else
@@ -10620,7 +11094,7 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts /dev/null PTY:/tmp/xyz"
+CMD0="$TRACE $SOCAT $opts /dev/null PTY:/tmp/xyz"
 printf "test $F_n $TEST... " $N
 $CMD0 >/dev/null 2>"${te}0"
 rc0=$?
@@ -10632,6 +11106,7 @@ else
     echo "$CMD0"
     cat "${te}0"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -10642,7 +11117,7 @@ N=$((N+1))
 # incomplete writes were reported but led to data loss
 NAME=INCOMPLETE_WRITE
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%$NAME%*)
 TEST="$NAME: check if incomplete writes are handled properly"
 # write to a nonblocking fd a block that is too large for atomic write
 # and check if all data arrives
@@ -10655,8 +11130,8 @@ tw="$td/test$N.wc-c"
 # make it large enough to exceed any atomic write size; but higher number might
 # take much time
 bytes=100000	# for Linux 2.6.? this must be >65536
-CMD0="$SOCAT $opts -u PIPE:$tp STDOUT"
-CMD1="$SOCAT $opts -u -b $bytes OPEN:/dev/zero,readbytes=$bytes FILE:$tp,o-nonblock"
+CMD0="$TRACE $SOCAT $opts -u PIPE:$tp STDOUT"
+CMD1="$TRACE $SOCAT $opts -u -b $bytes OPEN:/dev/zero,readbytes=$bytes FILE:$tp,o-nonblock"
 printf "test $F_n $TEST... " $N
 $CMD0 2>"${te}0" |wc -c >"$tw" &
 pid=$!
@@ -10677,6 +11152,7 @@ else
     $PRINTF "$FAILED\n"
     echo "transferred only $(cat $tw) of $bytes bytes" >&2
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -10686,7 +11162,7 @@ N=$((N+1))
 
 NAME=OPENSSL_ANULL
 case "$TESTS" in
-*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%openssl%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%$NAME%*)
 TEST="$NAME: OpenSSL server with cipher aNULL "
 if ! eval $NUMCOND; then :;
 elif ! testaddrs openssl >/dev/null; then
@@ -10700,21 +11176,22 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD2="$SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,$SOCAT_EGD,ciphers=aNULL,verify=0 pipe"
-CMD="$SOCAT $opts - openssl:$LOCALHOST:$PORT,ciphers=aNULL,verify=0,$SOCAT_EGD"
+CMD2="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,$SOCAT_EGD,ciphers=aNULL,verify=0 pipe"
+CMD="$TRACE $SOCAT $opts - openssl:$LOCALHOST:$PORT,ciphers=aNULL,verify=0,$SOCAT_EGD"
 printf "test $F_n $TEST... " $N
 eval "$CMD2 2>\"${te}1\" &"
 pid=$!	# background process id
 waittcp4port $PORT
 echo "$da" |$CMD >$tf 2>"${te}2"
 if ! echo "$da" |diff - "$tf" >"$tdiff"; then
-    $PRINTF "$FAILED: $SOCAT:\n"
+    $PRINTF "$FAILED: $TRACE $SOCAT:\n"
     echo "$CMD2 &"
     echo "$CMD"
     cat "${te}1"
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 else
    $PRINTF "$OK\n"
    if [ -n "$debug" ]; then cat "${te}1" "${te}2"; fi
@@ -10731,7 +11208,7 @@ N=$((N+1))
 # test the max-children option
 NAME=MAXCHILDREN
 case "$TESTS" in
-*%functions%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: max-children option"
 # start a listen process with max-children=1; connect with a client, let it
 # sleep some time before sending data; connect with second client that sends
@@ -10743,8 +11220,8 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts -U FILE:$tf,o-trunc,o-creat,o-append UNIX-L:$ts,fork,max-children=1"
-CMD1="$SOCAT $opts -u - UNIX-CONNECT:$ts"
+CMD0="$TRACE $SOCAT $opts -U FILE:$tf,o-trunc,o-creat,o-append UNIX-L:$ts,fork,max-children=1"
+CMD1="$TRACE $SOCAT $opts -u - UNIX-CONNECT:$ts"
 printf "test $F_n $TEST... " $N
 $CMD0 >/dev/null 2>"${te}0" &
 pid0=$!
@@ -10769,6 +11246,7 @@ else
     cat "${te}2"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -10781,7 +11259,7 @@ N=$((N+1))
 # problem reported by Johan Thillemann
 NAME=READLINE_OVFL
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%security%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%security%*|*%$NAME%*)
 TEST="$NAME: test for buffer overflow in readline prompt handling"
 # address 1 is the readline where write data was handled erroneous
 # address 2 provides data to trigger the buffer overflow
@@ -10796,7 +11274,7 @@ printf "test $F_n $TEST... " $N
 #perl -e 'print "\r","Z"x513' >"$ti"
 echo $E -n "\rA" >"$ti"
 i=0; while [ $i -lt 32 ]; do echo -n "AAAAAAAAAAAAAAAA" >>"$ti"; let i=i+1; done
-$SOCAT - system:"$CMD0; echo rc=\$? >&2",pty >/dev/null 2>"${te}0"
+$TRACE $SOCAT - SYSTEM:"$CMD0; echo rc=\$? >&2",pty >/dev/null 2>"${te}0"
 rc=$?
 rc0="$(grep ^rc= "${te}0" |sed 's/.*=//')"
 if [ $rc -ne 0 ]; then
@@ -10809,6 +11287,7 @@ else
     echo "$CMD0"
     grep -v ^rc= "${te}0"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;
@@ -10822,7 +11301,7 @@ N=$((N+1))
 # This file descriptor leak could be used for a denial of service attack.
 NAME=FDLEAK
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%security%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%security%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: file descriptor leak with range option"
 # have a TCP-LISTEN with range option; connect with wrong source address until
 # "open files" limit would exceed. When server continues operation the bug is
@@ -10836,9 +11315,9 @@ RLIMIT_NOFILE="$(ulimit -n)"
 if ! [[ "$RLIMIT_NOFILE" =~ ^[0-9][0-9]*$ ]]; then
     $PRINTF "${YELLOW}cannot determine ulimit -n"
 else
-CMD0="$SOCAT $opts TCP-LISTEN:$PORT,reuseaddr,range=$LOCALHOST:255.255.255.255 PIPE"
-CMD1="$SOCAT $opts -t 0 /dev/null TCP:$SECONDADDR:$PORT"
-CMD2="$SOCAT $opts - TCP:$LOCALHOST:$PORT"
+CMD0="$TRACE $SOCAT $opts TCP-LISTEN:$PORT,reuseaddr,range=$LOCALHOST:255.255.255.255 PIPE"
+CMD1="$TRACE $SOCAT $opts -t 0 /dev/null TCP:$SECONDADDR:$PORT,bind=$SECONDADDR"
+CMD2="$TRACE $SOCAT $opts - TCP:$LOCALHOST:$PORT,bind=$LOCALHOST"
 printf "test $F_n $TEST... " $N
 $CMD0 >/dev/null 2>"${te}0" &
 pid0=$!
@@ -10856,6 +11335,7 @@ if [ $rc2 -ne 0 ]; then
     echo "$CMD2 &"
     cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif [ -f "$tdiff" -a ! -s "$tdiff" ]; then
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -10868,6 +11348,7 @@ else
     cat "${te}1"
     cat "${te}2"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # ulimit -n
 fi # NUMCOND
@@ -10876,7 +11357,842 @@ esac
 PORT=$((PORT+1))
 N=$((N+1))
 
+
+if false; then	# this overflow is not reliably reproducable
+# socat up to 2.0.0-b6 did not check the length of the PROXY-CONNECT command line paramters when copying them into the HTTP request buffer. This could lead to a buffer overflow.
+NAME=PROXY_ADDR_OVFL
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%security%*|*%socket%*|*%$NAME%*)
+TEST="$NAME: proxy address parameters overflow"
+# invoke socat PROXY-CONNECT with long proxy server and target server names. If it terminates with exit code >= 128 it is vulnerable
+# However, even if vulnerable it often does not crash. Therefore we try to use a boundary check program like ElectricFence; only with its help we can tell that clean run proofs absence of vulnerability
+if ! eval $NUMCOND; then :; else
+tf="$td/test$N.stdout"
+te="$td/test$N.stderr"
+tdiff="$td/test$N.diff"
+da="test$N $(date) $RANDOM"
+EF=; for p in ef; do
+    if type ef >/dev/null 2>&1; then
+	EF="ef "; break
+    fi
+done
+CMD0="$TRACE $SOCAT $opts TCP-LISTEN:$PORT,reuseaddr FILE:/dev/null"
+#CMD1="$EF $TRACE $SOCAT $opts FILE:/dev/null PROXY-CONNECT:$(perl -e "print 'A' x 256"):$(perl -e "print 'A' x 256"):80"
+CMD1="$EF $TRACE $SOCAT $opts FILE:/dev/null PROXY-CONNECT:localhost:$(perl -e "print 'A' x 384"):80,proxyport=$PORT"
+printf "test $F_n $TEST... " $N
+$CMD0 >/dev/null 2>"${te}0" &
+pid0=$!
+waittcp4port $PORT 1
+$CMD1 >/dev/null 2>"${te}1"
+rc1=$?
+if [ $rc1 -lt 128 ]; then
+    if [ "$EF" ]; then
+	$PRINTF "$OK\n"
+	numOK=$((numOK+1))
+    else
+	$PRINTF "$UNKNOWN $RED(install ElectricFEnce!)$NORMAL\n"
+	numCANT=$((num+1))
+    fi
+else
+    $PRINTF "$FAILED\n"
+    echo "$CMD1"
+    cat "${te}"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+fi
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+fi	# false
+
+
+# LISTEN addresses in socat up to 1.7.2.1 applied many file descriptor, socket,
+# and TCP options only to the listening socket instead of the connection socket.
+NAME=LISTEN_KEEPALIVE
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%listen%*|*%keepalive%*|*%socket%*|*%$NAME%*)
+TEST="$NAME: keepalive option is applied to connection socket"
+# instance 0 has TCP-LISTEN with option so-keepalive and invokes filan after 
+# accept(). filan writes its output to the socket. instance 1 connects to 
+# instance 0. The value of the sockets so-keepalive option is checked, it must
+# be 1
+if ! eval $NUMCOND; then :; else
+tf="$td/test$N.stdout"
+te="$td/test$N.stderr"
+#tdiff="$td/test$N.diff"
+#da="test$N $(date) $RANDOM"
+CMD0="$TRACE $SOCAT $opts TCP4-LISTEN:$PORT,reuseaddr,so-keepalive EXEC:\"$FILAN -i 1\",nofork"
+CMD1="$TRACE $SOCAT $opts - TCP4:$LOCALHOST:$PORT"
+printf "test $F_n $TEST... " $N
+eval $CMD0 >/dev/null 2>"${te}0" &
+pid0=$!
+waittcp4port $PORT 1
+$CMD1 >"${tf}1" 2>"${te}1"
+KEEPALIVE="$(cat "${tf}1" |tail -n +2 |sed -e "s/.*KEEPALIVE=//" -e "s/[[:space:]].*//")"
+rc1=$?
+kill $pid0 2>/dev/null; wait
+if [ -z "$KEEPALIVE" ]; then
+    $PRINTF "$NO_RESULT\n"
+    echo "$CMD0 &"
+    echo "$CMD1"
+    cat "${te}0"
+    cat "${te}1"
+    numWARN=$((numWARN+1))
+elif [ "$KEEPALIVE" = "1" ]; then
+    $PRINTF "$OK\n";
+    numOK=$((numOK+1))
+else
+    $PRINTF "$FAILED\n"
+    echo "$CMD0 &"
+    echo "$CMD1"
+    cat "${te}0"
+    cat "${te}1"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+fi
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+
+
+# OPENSSL-CONNECT with bind option failed on some systems (eg.FreeBSD, but not
+# Linux) with "Invalid argument".
+NAME=OPENSSL_CONNECT_BIND
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%socket%*|*%openssl%*|*%$NAME%*)
+TEST="$NAME: test OPENSSL-CONNECT with bind option"
+# have a simple SSL server that just echoes data.
+# connect with socat using OPENSSL-CONNECT with bind, send data and check if the
+# reply is identical.
+if ! eval $NUMCOND; then :; else
+tf0="$td/test$N.0.stdout"
+te0="$td/test$N.0.stderr"
+tf1="$td/test$N.1.stdout"
+te1="$td/test$N.1.stderr"
+tdiff="$td/test$N.diff"
+da="test$N $(date) $RANDOM"
+CMD0="$TRACE $SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,ciphers=aNULL,verify=0, PIPE"
+CMD1="$TRACE $SOCAT $opts - OPENSSL-CONNECT:$LOCALHOST:$PORT,bind=$LOCALHOST,ciphers=aNULL,verify=0"
+printf "test $F_n $TEST... " $N
+$CMD0 >/dev/null 2>"$te0" &
+pid0=$!
+waittcp4port $PORT 1
+echo "$da" |$CMD1 >"$tf1" 2>"$te1"
+rc1=$?
+kill $pid0 2>/dev/null; wait
+if [ "$rc1" -ne 0 ]; then
+    $PRINTF "$FAILED\n"
+    echo "$CMD0 &"
+    echo "$CMD1"
+    cat "$te0"
+    cat "$te1"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+elif ! echo "$da" |diff - $tf1 >"$tdiff"; then
+    $PRINTF "$FAILED\n"
+    echo "$CMD0 &"
+    echo "$CMD1"
+    cat "${te}0"
+    cat "${te}1"
+    cat "$tdiff"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+else
+    $PRINTF "$OK\n"
+    numOK=$((numOK+1))
+fi
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+
+
+# socat up to version 1.7.2.3
+# had a bug that converted a bit mask of 0 internally to 0xffffffff
+NAME=TCP4RANGE_0BITS
+case "$TESTS" in
+*%$N%*|*%functions%*|*%tcp%*|*%tcp4%*|*%ip4%*|*%range%*|*%$NAME%*)
+TEST="$NAME: correct evaluation of range mask 0"
+if ! eval $NUMCOND; then :;
+elif [ -z "$SECONDADDR" ]; then
+    # we need access to a second addresses
+    $PRINTF "test $F_n $TEST... ${YELLOW}need a second IPv4 address${NORMAL}\n" $N
+    numCANT=$((numCANT+1))
+else
+tf="$td/test$N.stdout"
+te="$td/test$N.stderr"
+tdiff="$td/test$N.diff"
+da="test$N $(date) $RANDOM"
+#testserversec "$N" "$TEST" "$opts -s" "tcp4-l:$PORT,reuseaddr,fork,retry=1" "" "range=$SECONDADDR/32" "tcp4:127.0.0.1:$PORT" 4 tcp $PORT 0
+CMD0="$TRACE $SOCAT $opts -u TCP4-LISTEN:$PORT,reuseaddr,range=127.0.0.1/0 CREATE:$tf"
+CMD1="$TRACE $SOCAT $opts -u - TCP4-CONNECT:$SECONDADDR:$PORT,bind=$SECONDADDR"
+printf "test $F_n $TEST... " $N
+$CMD0 2>"${te}0" &
+pid0=$!
+waittcp4port $PORT 1
+echo "$da" |$CMD1 >"${tf}1" 2>"${te}1"
+rc1=$?
+kill $pid0 2>/dev/null; wait
+if [ $rc1 != 0 ]; then
+    $PRINTF "${YELLOW}invocation failed${NORMAL}\n"
+    numCANT=$((numCANT+1))
+elif ! [ -f "$tf" ]; then
+    $PRINTF "$FAILED\n"
+    echo "$CMD0 &"
+    echo "$CMD1"
+    cat "${te}0"
+    cat "${te}1"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+elif ! echo "$da" |diff - "$tf" >"$tdiff"; then
+    $PRINTF "${YELLOW}diff failed${NORMAL}\n"
+    numCANT=$((numCANT+1))
+else
+    $PRINTF "$OK\n"
+    numOK=$((numOK+1))
+fi
+
+fi ;; # $SECONDADDR, NUMCOND
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+
+
+# test: OPENSSL sets of environment variables with important values of peer certificate
+while read ssldist MODE MODULE FIELD TESTADDRESS PEERADDRESS VALUE; do
+if [ -z "$ssldist" ] || [[ "$ssldist" == \#* ]]; then continue; fi
+#
+SSLDIST=${ssldist^^*}
+NAME="ENV_${SSLDIST}_${MODE}_${MODULE}_${FIELD}"
+case "$TESTS" in
+*%$N%*|*%functions%*|*%ip4%*|*%ipapp%*|*%tcp%*|*%$ssldist%*|*%envvar%*|*%$NAME%*)
+TEST="$NAME: $SSLDIST sets env SOCAT_${SSLDIST}_${MODULE}_${FIELD}"
+# have a server accepting a connection and invoking some shell code. The shell
+# code extracts and prints the SOCAT related environment vars.
+# outside code then checks if the environment contains the variables correctly
+# describing the desired field.
+if ! eval $NUMCOND; then :;
+elif ! feat=$(testaddrs $FEAT); then
+    $PRINTF "test $F_n $TEST... ${YELLOW}$(echo "$feat" |tr a-z A-Z) not available${NORMAL}\n" $N
+    numCANT=$((numCANT+1))
+else
+tf="$td/test$N.stdout"
+te="$td/test$N.stderr"
+gentestcert testsrv
+gentestcert testcli
+test_proto=tcp4
+case "$MODE" in
+    SERVER)
+	CMD0="$SOCAT $opts -u $TESTADDRESS system:\"echo SOCAT_${SSLDIST}_${MODULE}_${FIELD}=\\\$SOCAT_${SSLDIST}_${MODULE}_${FIELD}; sleep 1\""
+	CMD1="$SOCAT $opts -u /dev/null $PEERADDRESS"
+	printf "test $F_n $TEST... " $N
+	eval "$CMD0 2>\"${te}0\" >\"$tf\" &"
+	pid0=$!
+	wait${test_proto}port $PORT 1
+	$CMD1 2>"${te}1"
+	rc1=$?
+	waitfile "$tf" 2
+	kill $pid0 2>/dev/null; wait
+	;;
+    CLIENT)
+	CMD0="$SOCAT $opts -u /dev/null $PEERADDRESS"
+	CMD1="$SOCAT $opts -u $TESTADDRESS system:\"echo SOCAT_${SSLDIST}_${MODULE}_${FIELD}=\\\$SOCAT_${SSLDIST}_${MODULE}_${FIELD}; sleep 1\""
+	printf "test $F_n $TEST... " $N
+	$CMD0 2>"${te}0" &
+	pid0=$!
+	wait${test_proto}port $PORT 1
+	eval "$CMD1 2>\"${te}1\" >\"$tf\""
+	rc1=$?
+	waitfile "$tf" 2
+	kill $pid0 2>/dev/null; wait
+	;;
+esac
+if [ $rc1 != 0 ]; then
+    $PRINTF "$NO_RESULT (client failed):\n"
+    echo "$CMD0 &"
+    cat "${te}0"
+    echo "$CMD1"
+    cat "${te}1"
+    numCANT=$((numCANT+1))
+elif effval="$(grep SOCAT_${SSLDIST}_${MODULE}_${FIELD} "${tf}" |sed -e 's/^[^=]*=//' |sed -e "s/[\"']//g")";
+    [ "$effval" = "$VALUE" ]; then
+    $PRINTF "$OK\n"
+    if [ "$debug" ]; then
+	echo "$CMD0 &"
+	cat "${te}0"
+	echo "$CMD1"
+	cat "${te}1"
+    fi
+    numOK=$((numOK+1))
+else
+    $PRINTF "$FAILED\n"
+    echo "expected \"$VALUE\", got \"$effval\"" >&2
+    echo "$CMD0 &"
+    cat "${te}0"
+    echo "$CMD1"
+    cat "${te}1"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+fi
+fi # NUMCOND, feats
+ ;;
+esac
+N=$((N+1))
+#
+done <<<"
+openssl SERVER X509 ISSUER  OPENSSL-LISTEN:$PORT,so-reuseaddr,bind=$LOCALHOST,cert=testsrv.pem,cafile=testcli.crt,verify=1 OPENSSL-CONNECT:$LOCALHOST:$PORT,cert=testcli.pem,cafile=testsrv.crt,verify=1 $TESTCERT_ISSUER
+openssl SERVER X509 SUBJECT OPENSSL-LISTEN:$PORT,so-reuseaddr,bind=$LOCALHOST,cert=testsrv.pem,cafile=testcli.crt,verify=1 OPENSSL-CONNECT:$LOCALHOST:$PORT,cert=testcli.pem,cafile=testsrv.crt,verify=1 $TESTCERT_SUBJECT
+openssl SERVER X509 COMMONNAME             OPENSSL-LISTEN:$PORT,so-reuseaddr,bind=$LOCALHOST,cert=testsrv.pem,cafile=testcli.crt,verify=1 OPENSSL-CONNECT:$LOCALHOST:$PORT,cert=testcli.pem,cafile=testsrv.crt,verify=1 $TESTCERT_COMMONNAME
+openssl SERVER X509 COUNTRYNAME            OPENSSL-LISTEN:$PORT,so-reuseaddr,bind=$LOCALHOST,cert=testsrv.pem,cafile=testcli.crt,verify=1 OPENSSL-CONNECT:$LOCALHOST:$PORT,cert=testcli.pem,cafile=testsrv.crt,verify=1 $TESTCERT_COUNTRYNAME
+openssl SERVER X509 LOCALITYNAME           OPENSSL-LISTEN:$PORT,so-reuseaddr,bind=$LOCALHOST,cert=testsrv.pem,cafile=testcli.crt,verify=1 OPENSSL-CONNECT:$LOCALHOST:$PORT,cert=testcli.pem,cafile=testsrv.crt,verify=1 $TESTCERT_LOCALITYNAME
+openssl SERVER X509 ORGANIZATIONALUNITNAME OPENSSL-LISTEN:$PORT,so-reuseaddr,bind=$LOCALHOST,cert=testsrv.pem,cafile=testcli.crt,verify=1 OPENSSL-CONNECT:$LOCALHOST:$PORT,cert=testcli.pem,cafile=testsrv.crt,verify=1 $TESTCERT_ORGANIZATIONALUNITNAME
+openssl SERVER X509 ORGANIZATIONNAME       OPENSSL-LISTEN:$PORT,so-reuseaddr,bind=$LOCALHOST,cert=testsrv.pem,cafile=testcli.crt,verify=1 OPENSSL-CONNECT:$LOCALHOST:$PORT,cert=testcli.pem,cafile=testsrv.crt,verify=1 $TESTCERT_ORGANIZATIONNAME
+openssl CLIENT X509 SUBJECT OPENSSL-CONNECT:$LOCALHOST:$PORT,cert=testcli.pem,cafile=testsrv.crt,verify=1 OPENSSL-LISTEN:$PORT,so-reuseaddr,bind=$LOCALHOST,cert=testsrv.pem,cafile=testcli.crt,verify=1 $TESTCERT_SUBJECT
+openssl CLIENT X509 ISSUER  OPENSSL-CONNECT:$LOCALHOST:$PORT,cert=testcli.pem,cafile=testsrv.crt,verify=1 OPENSSL-LISTEN:$PORT,so-reuseaddr,bind=$LOCALHOST,cert=testsrv.pem,cafile=testcli.crt,verify=1 $TESTCERT_ISSUER
+"
+
+
 ###############################################################################
+# tests: option umask with "passive" NAMED group addresses
+while read addr fileopt addropts proto diropt ADDR2; do
+if [ -z "$addr" ] || [[ "$addr" == \#* ]]; then continue; fi
+# some passive (listening...) filesystem based addresses did not implement the
+# umask option
+ADDR=${addr^^*}
+ADDR_=${ADDR/-/_}
+PROTO=${proto^^*}
+if [ "$diropt" = "." ]; then diropt=; fi
+if [ "$fileopt" = "." ]; then fileopt=; fi
+if [ "$addropts" = "." ]; then addropts=; fi
+NAME=${ADDR_}_UMASK
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%proto%*|*%socket%*|*%$proto%*|*%$NAME%*)
+TEST="$NAME: $ADDR applies option umask"
+# start a socat process with passive/listening file system entry. Check the
+# permissions of the FS entry, then terminate the process.
+# Test succeeds when FS entry exists and has expected permissions.
+if ! eval $NUMCOND; then :; else
+                            if [ $ADDR = PTY ]; then  set -xv; fi
+tlog="$td/test$N.log"
+te0="$td/test$N.0.stderr"
+tsock="$td/test$N.sock"
+if [ -z "$fileopt" ]; then
+    CMD0="$TRACE $SOCAT $opts $diropt $ADDR:$tsock,$addropts,unlink-close=0,umask=177 $ADDR2"
+else
+    CMD0="$TRACE $SOCAT $opts $diropt $ADDR,$fileopt=$tsock,$addropts,unlink-close=0,umask=177 $ADDR2"
+fi
+printf "test $F_n $TEST... " $N
+$CMD0 >/dev/null 2>"$te0" &
+pid0=$!
+wait${proto} $tsock 1 2>"$tlog"
+ERRNOENT=; if ! [ -e "$tsock" ]; then  ERRNOENT=1;  fi
+perms=$(fileperms "$tsock")
+kill $pid0 2>>"$tlog"
+wait
+if [ "$ERRNOENT" ]; then
+    $PRINTF "${RED}no entry${NORMAL}\n"
+    echo "$CMD0 &"
+    cat "$te0"
+    cat "$tlog"
+    let numFAIL=numFAIL+1
+    listFAIL="$listFAIL $N"
+elif [ "$perms" != "600" ]; then
+    $PRINTF "${RED}perms \"$perms\", expected \"600\" ${NORMAL}\n"
+    echo "$CMD0 &"
+    cat "$te0"
+    let numFAIL=numFAIL+1
+    listFAIL="$listFAIL $N"
+else
+    $PRINTF "$OK\n"
+    let numOK=numOK+1
+fi
+                               set +xv
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+#
+done <<<"
+# address     fileopt addropts waitfor direction ADDR2
+create        .       .        file     -U       FILE:/dev/null
+open          .       creat    file     .        FILE:/dev/null
+gopen         .       creat    file     .        FILE:/dev/null
+unix-listen   .       .        unixport .        FILE:/dev/null
+unix-recvfrom .       .        unixport .        FILE:/dev/null
+unix-recv     .       .        unixport -u       FILE:/dev/null
+pipe          .       .        file     -u       FILE:/dev/null
+# pty does not seem to honor umask:
+#pty           link    .        file     .        PIPE
+"
+
+
+# tests: option perm with "passive" NAMED group addresses
+while read addr fileopt addropts proto diropt; do
+if [ -z "$addr" ] || [[ "$addr" == \#* ]]; then continue; fi
+# test if passive (listening...) filesystem based addresses implement option perm
+ADDR=${addr^^*}
+ADDR_=${ADDR/-/_}
+PROTO=${proto^^*}
+if [ "$diropt" = "." ]; then diropt=; fi
+if [ "$fileopt" = "." ]; then fileopt=; fi
+if [ "$addropts" = "." ]; then addropts=; fi
+NAME=${ADDR_}_PERM
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%proto%*|*%socket%*|*%$proto%*|*%ignoreeof%*|*%$NAME%*)
+TEST="$NAME: $ADDR applies option perm"
+# start a socat process with passive/listening file system entry. Check the
+# permissions of the FS entry, then terminate the process.
+# Test succeeds when FS entry exists and has expected permissions.
+if ! eval $NUMCOND; then :; else
+tlog="$td/test$N.log"
+te0="$td/test$N.0.stderr"
+tsock="$td/test$N.sock"
+#                                      set -vx
+if [ -z "$fileopt" ]; then
+    CMD0="$TRACE $SOCAT $opts $diropt $ADDR:$tsock,$addropts,perm=511 FILE:/dev/null,ignoreeof"
+else
+    CMD0="$TRACE $SOCAT $opts $diropt $ADDR,$fileopt=$tsock,$addropts,perm=511 FILE:/dev/null,ignoreeof"
+fi
+printf "test $F_n $TEST... " $N
+$CMD0 >/dev/null 2>"$te0" &
+pid0=$!
+wait${proto} $tsock 1 2>"$tlog"
+ERRNOENT=; if ! [ -e "$tsock" ]; then  ERRNOENT=1;  fi
+perms=$(fileperms "$tsock")
+kill $pid0 2>>"$tlog"
+wait
+if [ "$ERRNOENT" ]; then
+    $PRINTF "${RED}no entry${NORMAL}\n"
+    echo "$CMD0 &"
+    cat "$te0"
+    cat "$tlog"
+    let numFAIL=numFAIL+1
+    listFAIL="$listFAIL $N"
+elif [ "$perms" != "511" ]; then
+    $PRINTF "${RED}perms \"$perms\", expected \"511\" ${NORMAL}\n"
+    echo "$CMD0 &"
+    cat "$te0"
+    let numFAIL=numFAIL+1
+    listFAIL="$listFAIL $N"
+else
+    $PRINTF "$OK\n"
+    let numOK=numOK+1
+fi
+                                      set +vx
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+#
+done <<<"
+# address     fileopt addropts waitfor direction
+create        .       .        file     -U
+open          .       creat    file     .
+gopen         .       creat    file     .
+unix-listen   .       .        unixport .
+unix-recvfrom .       .        unixport .
+unix-recv     .       .        unixport -u
+pipe          .       .        file     -u
+pty           link    .        file     .
+"
+
+
+# tests: option user with "passive" NAMED group addresses
+while read addr fileopt addropts proto diropt; do
+if [ -z "$addr" ] || [[ "$addr" == \#* ]]; then continue; fi
+# test if passive (listening...) filesystem based addresses implement option user
+ADDR=${addr^^*}
+ADDR_=${ADDR/-/_}
+PROTO=${proto^^*}
+if [ "$diropt" = "." ]; then diropt=; fi
+if [ "$fileopt" = "." ]; then fileopt=; fi
+if [ "$addropts" = "." ]; then addropts=; fi
+NAME=${ADDR_}_USER
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%proto%*|*%socket%*|*%$proto%*|*%root%*|*%ignoreeof%*|*%$NAME%*)
+TEST="$NAME: $ADDR applies option user"
+# start a socat process with passive/listening file system entry with user option.
+# Check the owner of the FS entry, then terminate the process.
+# Test succeeds when FS entry exists and has expected owner.
+if ! eval $NUMCOND; then :;
+elif [ $(id -u) -ne 0 -a "$withroot" -eq 0 ]; then
+    $PRINTF "test $F_n $TEST... ${YELLOW}must be root${NORMAL}\n" $N
+    numCANT=$((numCANT+1))
+else
+tlog="$td/test$N.log"
+te0="$td/test$N.0.stderr"
+tsock="$td/test$N.sock"
+#                                      set -vx
+if [ -z "$fileopt" ]; then
+    CMD0="$TRACE $SOCAT $opts $diropt $ADDR:$tsock,$addropts,user=$SUBSTUSER FILE:/dev/null,ignoreeof"
+else
+    CMD0="$TRACE $SOCAT $opts $diropt $ADDR,$fileopt=$tsock,$addropts,user=$SUBSTUSER FILE:/dev/null,ignoreeof"
+fi
+printf "test $F_n $TEST... " $N
+$CMD0 >/dev/null 2>"$te0" &
+pid0=$!
+wait${proto} $tsock 1 2>"$tlog"
+ERRNOENT=; if ! [ -e "$tsock" ]; then  ERRNOENT=1;  fi
+user=$(fileuser "$tsock")
+kill $pid0 2>>"$tlog"
+wait
+if [ "$ERRNOENT" ]; then
+    $PRINTF "${RED}no entry${NORMAL}\n"
+    echo "$CMD0 &"
+    cat "$te0"
+    cat "$tlog"
+    let numFAIL=numFAIL+1
+    listFAIL="$listFAIL $N"
+elif [ "$user" != "$SUBSTUSER" ]; then
+    $PRINTF "${RED}user \"$user\", expected \"$SUBSTUSER\" ${NORMAL}\n"
+    echo "$CMD0 &"
+    cat "$te0"
+    let numFAIL=numFAIL+1
+    listFAIL="$listFAIL $N"
+else
+    $PRINTF "$OK\n"
+    let numOK=numOK+1
+fi
+                                      set +vx
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+#
+done <<<"
+# address     fileopt addropts waitfor direction
+create        .       .        file     -U
+open          .       creat    file     .
+gopen         .       creat    file     .
+unix-listen   .       .        unixport .
+unix-recvfrom .       .        unixport .
+unix-recv     .       .        unixport -u
+pipe          .       .        file     -u
+pty           link    .        file     .
+"
+
+
+# tests: is "passive" filesystem entry removed at the end? (without fork)
+while read addr fileopt addropts proto diropt crit ADDR2; do
+if [ -z "$addr" ] || [[ "$addr" == \#* ]]; then continue; fi
+# some passive (listening...) filesystem based addresses did not remove the file
+# system entry at the end
+ADDR=${addr^^*}
+ADDR_=${ADDR/-/_}
+PROTO=${proto^^*}
+if [ "$diropt" = "." ]; then diropt=; fi
+if [ "$fileopt" = "." ]; then fileopt=; fi
+if [ "$addropts" = "." ]; then addropts=; fi
+# $ADDR removes the file system entry when the process is terminated
+NAME=${ADDR_}_REMOVE
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%unix%*|*%socket%*|*%$NAME%*)
+TEST="$NAME: $ADDR removes socket entry when terminated during accept"
+# start a socat process with listening unix domain socket etc. Terminate the
+# process and check if the file system socket entry still exists.
+# Test succeeds when entry does not exist.
+if ! eval $NUMCOND; then :; else
+tlog="$td/test$N.log"
+te0="$td/test$N.0.stderr"
+tsock="$td/test$N.sock"
+if [ -z "$fileopt" ]; then
+    CMD0="$TRACE $SOCAT $opts $diropt $ADDR:$tsock,$addropts $ADDR2"
+else
+    CMD0="$TRACE $SOCAT $opts $diropt $ADDR,$fileopt=$tsock,$addropts $ADDR2"
+fi
+printf "test $F_n $TEST... " $N
+$CMD0 >/dev/null 2>"$te0" &
+pid0=$!
+wait${proto} "$crit" $tsock 1 2>"$tlog"
+kill $pid0 2>>"$tlog"
+rc1=$?
+wait >>"$tlog"
+if [ $rc1 != 0 ]; then
+    $PRINTF "${YELLOW}setup failed${NORMAL}\n"
+    echo "$CMD0 &"
+    cat "$te0"
+    cat "$tlog"
+    let numCANT=numCANT+1
+elif ! [ $crit $tsock ]; then
+    $PRINTF "$OK\n"
+    let numOK=numOK+1
+else
+    $PRINTF "$FAILED\n"
+    echo "$CMD0 &"
+    cat "$te0"
+    cat "$tlog"
+    let numFAIL=numFAIL+1
+    listFAIL="$listFAIL $N"
+fi
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+#
+done <<<"
+# address     fileopt addropts waitfor direction crit ADDR2
+unix-listen   .       .        unixport .        -e   FILE:/dev/null
+unix-recvfrom .       .        unixport .        -e   FILE:/dev/null
+unix-recv     .       .        unixport -u       -e   FILE:/dev/null
+pipe          .       .        file     -u       -e   FILE:/dev/null
+pty           link    .        file     .        -L   PIPE
+"
+
+
+# tests: is "passive" filesystem entry removed at the end? (with fork)
+while read addr fileopt addropts proto diropt crit ADDR2; do
+if [ -z "$addr" ] || [[ "$addr" == \#* ]]; then continue; fi
+# some passive (listening...) filesystem based addresses with fork did not remove
+# the file system entry at the end
+ADDR=${addr^^*}
+ADDR_=${ADDR/-/_}
+PROTO=${proto^^*}
+if [ "$diropt" = "." ]; then diropt=; fi
+if [ "$fileopt" = "." ]; then fileopt=; fi
+if [ "$addropts" = "." ]; then addropts=; fi
+# $ADDR with fork removes the file system entry when the process is terminated
+NAME=${ADDR_}_REMOVE_FORK
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%unix%*|*%socket%*|*%$NAME%*)
+TEST="$NAME: $ADDR with fork removes socket entry when terminated during accept"
+# start a socat process with listening unix domain socket etc and option fork.
+# Terminate the process and check if the file system socket entry still exists.
+# Test succeeds when entry does not exist.
+if ! eval $NUMCOND; then :; else
+tlog="$td/test$N.log"
+te0="$td/test$N.0.stderr"
+tsock="$td/test$N.sock"
+if [ -z "$fileopt" ]; then
+    CMD0="$TRACE $SOCAT $opts $diropt $ADDR:$tsock,fork,$addropts $ADDR2"
+else
+    CMD0="$TRACE $SOCAT $opts $diropt $ADDR,fork,$fileopt=$tsock,$addropts $ADDR2"
+fi
+printf "test $F_n $TEST... " $N
+$CMD0 >/dev/null 2>"$te0" &
+pid0=$!
+wait${proto} "$crit" $tsock 1 2>"$tlog"
+kill $pid0 2>>"$tlog"
+rc1=$?
+wait
+if [ $rc1 != 0 ]; then
+    $PRINTF "${YELLOW}setup failed${NORMAL}\n"
+    echo "$CMD0 &"
+    cat "$te0"
+    cat "$tlog"
+    let numCANT=numCANT+1
+elif ! [ $crit $tsock ]; then
+    $PRINTF "$OK\n"
+    let numOK=numOK+1
+else
+    $PRINTF "$FAILED\n"
+    echo "$CMD0 &"
+    cat "$te0"
+    cat "$tlog"
+    let numFAIL=numFAIL+1
+    listFAIL="$listFAIL $N"
+fi
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+#
+done <<<"
+# address     fileopt addropts waitfor direction crit ADDR2
+unix-listen   .       .        unixport .        -e   FILE:/dev/null
+unix-recvfrom .       .        unixport .        -e   FILE:/dev/null
+"
+
+
+# bug fix: SYSTEM address child process shut down parents sockets including
+# SSL connection under some circumstances.
+NAME=SYSTEM_SHUTDOWN
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%system%*|*%openssl%*|*%socket%*|*%$NAME%*)
+TEST="$NAME: SYSTEM address does not shutdown its parents addresses"
+# start an OpenSSL echo server using SYSTEM:cat
+# start an OpenSSL client that sends data
+# when the client recieves its data and terminates without error the test succeeded
+# in case of the bug the client issues an error like:
+# SSL_connect(): error:1408F119:SSL routines:SSL3_GET_RECORD:decryption failed or bad record mac
+if ! eval $NUMCOND; then :; else
+tf="$td/test$N.stdout"
+te="$td/test$N.stderr"
+tdiff="$td/test$N.diff"
+da="test$N $(date) $RANDOM"
+CMD0="$SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,cipher=aNULL,verify=0 SYSTEM:cat"
+CMD1="$SOCAT $opts - OPENSSL-CONNECT:$LOCALHOST:$PORT,cipher=aNULL,verify=0"
+printf "test $F_n $TEST... " $N
+$CMD0 >/dev/null 2>"${te}0" &
+pid0=$!
+waittcp4port $PORT 1
+echo "$da" |$CMD1 >"${tf}1" 2>"${te}1"
+rc1=$?
+kill $pid0 2>/dev/null; wait
+if [ $rc1 -ne 0 ]; then
+    $PRINTF "$FAILED\n"
+    echo "rc1=$rc1"
+    echo "$CMD0 &"
+    echo "$CMD1"
+    cat "${te}0"
+    cat "${te}1"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+elif ! echo "$da" |diff - "${tf}1" >"$tdiff" 2>&1; then
+    $PRINTF "$FAILED\n"
+    echo "diff:"
+    cat "$tdiff"
+    echo "$CMD0 &"
+    echo "$CMD1"
+    cat "${te}0"
+    cat "${te}1"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+else
+    $PRINTF "$OK\n"
+    numOK=$((numOK+1))
+fi
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+
+
+# test if TCP4-LISTEN with empty port arg terminates with error
+NAME=TCP4_NOPORT
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%socket%*|*%tcp%*|*%tcp4%*|*%$NAME%*)
+TEST="$NAME: test if TCP4-LISTEN with empty port arg bails out"
+# run socat with TCP4-LISTEN with empty port arg. Check if it terminates
+# immediately with return code 1
+if ! eval $NUMCOND; then :; else
+tf="$td/test$N.stdout"
+te="$td/test$N.stderr"
+t0rc="$td/test$N.rc"
+tdiff="$td/test$N.diff"
+da="test$N $(date) $RANDOM"
+CMD0="$SOCAT $opts TCP4-LISTEN: /dev/null"
+printf "test $F_n $TEST... " $N
+{ $CMD0 >/dev/null 2>"${te}0"; echo $? >"$t0rc"; } & 2>/dev/null
+pid0=$!
+sleep 1
+kill $pid0 2>/dev/null; wait
+if [ ! -f "$t0rc" ]; then
+    $PRINTF "$FAILED\n"
+    echo "no return code of CMD0 stored" >&2
+    echo "$CMD0 &"
+    cat "${te}0"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+elif ! echo 1 |diff - "$t0rc" >"$tdiff"; then
+    $PRINTF "$FAILED\n"
+    echo "CMD0 exited with $(cat $t0rc), expected 1"
+    echo "$CMD0 &"
+    cat "${te}0"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+else
+    $PRINTF "$OK\n"
+    numOK=$((numOK+1))
+fi
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+
+# test if the various SSL methods can be used with OpenSSL
+for method in SSL3 SSL23 TLS1 TLS1.1 TLS1.2 DTLS1; do
+
+NAME=OPENSSL_METHOD_$method
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%socket%*|*%openssl%*|*%$NAME%*)
+TEST="$NAME: test OpenSSL method $method"
+# Start a socat process listening with OpenSSL and echoing data,
+# using the selected method
+# Start a second socat process connecting to the listener using
+# the same method, send some data and catch the reply.
+# If the reply is identical to the sent data the test succeeded.
+if ! eval $NUMCOND; then :; else
+tf="$td/test$N.stdout"
+te="$td/test$N.stderr"
+tdiff="$td/test$N.diff"
+da="test$N $(date) $RANDOM"
+CMD0="$SOCAT $opts OPENSSL-LISTEN:$PORT,reuseaddr,method=$method,cipher=aNULL,verify=0 PIPE"
+CMD1="$SOCAT $opts - OPENSSL-CONNECT:$LOCALHOST:$PORT,method=$method,cipher=aNULL,verify=0"
+printf "test $F_n $TEST... " $N
+$CMD0 >/dev/null 2>"${te}0" &
+pid0=$!
+waittcp4port $PORT 1
+echo "$da" |$CMD1 >"${tf}1" 2>"${te}1"
+rc1=$?
+kill $pid0 2>/dev/null; wait
+if echo "$da" |diff - "${tf}1"; then
+    $PRINTF "$OK\n"
+    numOK=$((numOK+1))
+else
+    $PRINTF "$FAILED\n"
+    echo "$CMD0 &"
+    echo "$CMD1"
+    cat "${te}0"
+    cat "${te}1"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+fi
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+
+done
+
+
+# give a description of what is tested (a bugfix, a new feature...)
+NAME=FDOUT_ERROR
+case "$TESTS" in
+*%$N%*|*%functions%*|*%bugs%*|*%socket%*|*%$NAME%*)
+TEST="$NAME: fdout bails out in write-only context"
+# use EXEC in write-only context with option fdout. Expected behaviour: error
+if ! eval $NUMCOND; then :; else
+tf="$td/test$N.stdout"
+te="$td/test$N.stderr"
+tdiff="$td/test$N.diff"
+da="test$N $(date) $RANDOM"
+CMD="$SOCAT $opts -u /dev/null EXEC:cat,fdout=1"
+printf "test $F_n $TEST... " $N
+$CMD >/dev/null 2>"${te}"
+rc=$?
+if [ $rc -eq 1 ]; then
+    $PRINTF "$OK\n"
+    numOK=$((numOK+1))
+else
+    $PRINTF "$FAILED\n"
+    echo "$CMD"
+    cat "${te}"
+    echo "command did not terminate with error!"
+    numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
+fi
+fi # NUMCOND
+ ;;
+esac
+PORT=$((PORT+1))
+N=$((N+1))
+
+
+##################################################################################
+#=================================================================================
 # here come tests that might affect your systems integrity. Put normal tests
 # before this paragraph.
 # tests must be explicitely selected by roottough or name (not number)
@@ -10910,8 +12226,8 @@ te="$td/test$N.stderr"
 tl="$td/test$N.pty"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts pty,link=$tl,group-late=$GROUP,escape=0x1a PIPE"
-CMD1="$SOCAT $opts - $tl,raw,echo=0"
+CMD0="$TRACE $SOCAT $opts pty,link=$tl,group-late=$GROUP,escape=0x1a PIPE"
+CMD1="$TRACE $SOCAT $opts - $tl,raw,echo=0"
 $CMD0 >/dev/null 2>"${te}0" &
 pid0=$!
 (echo "$da"; usleep $MICROS; echo -e "\x1a") |$CMD1 >"${tf}1" 2>"${te}1" >"$tf"
@@ -10924,6 +12240,7 @@ if [ $rc1 -ne 0 ]; then
     cat "${te}0"
     cat "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 elif echo "$da" |diff - "$tf" >$tdiff; then
     $PRINTF "$OK\n"
     numOK=$((numOK+1))
@@ -10931,6 +12248,7 @@ else
     $PRINTF "$FAILED\n"
     cat "$tdiff"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 if ! ls -l $f |diff "$td/test$N.$F.ls-l" -; then
     $PRINTF "${RED}this test changed properties of $f!${NORMAL}\n"
@@ -10942,9 +12260,10 @@ esac
 N=$((N+1))
 
 
-echo "summary: $((N-1)) tests; $numOK ok, $numFAIL failed, $numCANT could not be performed"
+echo "summary: $((N-1)) tests, $((numOK+numFAIL+numCANT)) selected; $numOK ok, $numFAIL failed, $numCANT could not be performed"
 
 if [ "$numFAIL" -gt 0 ]; then
+    echo "FAILED: $listFAIL"
     exit 1
 fi
 exit 0
@@ -10969,7 +12288,7 @@ exit
 # give a description of what is tested (a bugfix, a new feature...)
 NAME=SHORT_UNIQUE_TESTNAME
 case "$TESTS" in
-*%functions%*|*%bugs%*|*%socket%*|*%$NAME%*)
+*%$N%*|*%functions%*|*%bugs%*|*%socket%*|*%$NAME%*)
 TEST="$NAME: give a one line description of test"
 # describe how the test is performed, and what's the success criteria
 if ! eval $NUMCOND; then :; else
@@ -10977,8 +12296,8 @@ tf="$td/test$N.stdout"
 te="$td/test$N.stderr"
 tdiff="$td/test$N.diff"
 da="test$N $(date) $RANDOM"
-CMD0="$SOCAT $opts server-address PIPE"
-CMD1="$SOCAT $opts - client-address"
+CMD0="$TRACE $SOCAT $opts server-address PIPE"
+CMD1="$TRACE $SOCAT $opts - client-address"
 printf "test $F_n $TEST... " $N
 $CMD0 >/dev/null 2>"${te}0" &
 pid0=$!
@@ -10996,6 +12315,7 @@ else
     cat "${te}0"
     cat "${te}1"
     numFAIL=$((numFAIL+1))
+    listFAIL="$listFAIL $N"
 fi
 fi # NUMCOND
  ;;

@@ -1,7 +1,253 @@
 
+####################### V 1.7.3.0:
+
+security:
+	(CVE Id pending)
+	Fixed problems with signal handling caused by use of not async signal
+	safe functions in signal handlers that could freeze socat, allowing
+	denial of service attacks.
+	Many changes in signal handling and the diagnostic messages system were
+	applied to make the code async signal safe but still provide detailled
+	logging from signal handlers:
+	Coded function vsnprintf_r() as async signal safe incomplete substitute
+	of libc vsnprintf()
+	Coded function snprinterr() to replace %m in strings with a system error
+	message
+	Instead of gettimeofday() use clock_gettime() when available
+	Pass Diagnostic messages from signal handler per unix socket to the main
+	program flow
+	Use sigaction() instead of signal() for better control
+	Turn off nested signal handler invocations
+	Thanks to Peter Lobsinger for reporting and explaining this issue.
+
+	Red Hat issue 1019975: add TLS host name checks
+	OpenSSL client checks if the server certificates names in
+	extensions/subjectAltName/DNS or in subject/commonName match the name
+	used to connect or the value of the openssl-commonname option.
+	Test: OPENSSL_CN_CLIENT_SECURITY
+
+	OpenSSL server checks if the client certificates names in
+	extensions/subjectAltNames/DNS or subject/commonName match the value of
+	the openssl-commonname option when it is used.
+	Test: OPENSSL_CN_SERVER_SECURITY
+
+	Red Hat issue 1019964: socat now uses the system certificate store with
+	OPENSSL when neither options cafile nor capath are used
+
+	Red Hat issue 1019972: needs to specify OpenSSL cipher suites
+	Default cipherlist is now "HIGH:-NULL:-PSK:-aNULL" instead of empty to
+	prevent downgrade attacks
+
+new features:
+	OpenSSL addresses set couple of environment variables from values in
+	peer certificate, e.g.: 
+	SOCAT_OPENSSL_X509_SUBJECT, SOCAT_OPENSSL_X509_ISSUER,
+	SOCAT_OPENSSL_X509_COMMONNAME, 
+	SOCAT_OPENSSL_X509V3_SUBJECTALTNAME_DNS
+	Tests: ENV_OPENSSL_{CLIENT,SERVER}_X509_*
+
+	Added support for methods TLSv1, TLSv1.1, TLSv1.2, and DTLS1
+	Tests: OPENSSL_METHOD_*
+
+	Enabled OpenSSL server side use of ECDHE ciphers. Feature suggested
+	by Andrey Arapov.
+
+	Added a new option termios-rawer for ptys.
+	Thanks to Christian Vogelgsang for pointing me to this requirement
+
+corrections:
+	Bind with ABSTRACT commands used non-abstract namespace (Linux).
+	Test: ABSTRACT_BIND
+	Thanks to Denis Shatov for reporting this bug.
+
+	Fixed return value of nestlex()
+
+	Option ignoreeof on the right address hung.
+	Test: IGNOREEOF_REV
+	Thanks to Franz Fasching for reporting this bug.
+
+	Address SYSTEM, when terminating, shut down its parent addresses,
+	e.g. an SSL connection which the parent assumed to still be active.
+	Test: SYSTEM_SHUTDOWN
+
+	Passive (listening or receiving) addresses with empty port field bound
+	to a random port instead of terminating with error.
+	Test: TCP4_NOPORT
+
+	configure with some combination of disable options produced config
+	files that failed to compile due to missing IPPROTO_TCP.
+	Thanks to Thierry Fournier for report and patch.
+
+	fixed a few minor bugs with OpenSSL in configure and with messages
+
+	Socat did not work in FIPS mode because 1024 instead of 512 bit DH prime
+	is required. Thanks to Zhigang Wang for reporting and sending a patch.
+
+	Christophe Leroy provided a patch that fixes memory leaks reported by
+	valgrind
+
+	Help for filan -L was bad, is now corrected to:
+	"follow symbolic links instead of showing their properties"
+
+	Address options fdin and fdout were silently ignored when not applicable
+	due to -u or -U option. Now these combinations are caught as errors.
+	Test: FDOUT_ERROR
+	Issue reported by Hendrik.
+
+	Added option termios-cfmakeraw that calls cfmakeraw() and is preferred
+	over option raw which is now obsolote. On SysV systems this call is
+	simulated by appropriate setting.
+	Thanks to Youfu Zhang for reporting issue with option raw.
+
+porting:
+	Socat included <sys/poll.h> instead of POSIX <poll.h>
+	Thanks to John Spencer for reporting this issue.
+
+	Version 1.7.2.4 changed the check for gcc in configure.ac; this
+	broke cross compiling. The particular check gets reverted.
+	Thanks to Ross Burton and Danomi Manchego for reporting this issue.
+
+	Debian Bug#764251: Set the build timestamp to a deterministic time:
+	support external BUILD_DATE env var to allow to build reproducable
+	binaries
+
+	Joachim Fenkes provided an new adapted spec file.
+
+	Type bool and macros Min and Max are defined by socat which led to
+	compile errors when they were already provided by build framework.
+	Thanks to Liyu Liu for providing a patch.
+
+	David Arnstein contributed a patch for NetBSD 5.1 including stdbool.h
+	support and appropriate files in Config/
+
+	Lauri Tirkkonen contributed a patch regarding netinet/if_ether.h
+	on Illumos
+
+	Changes for Openindiana: define _XPG4_2, __EXTENSIONS__,
+	_POSIX_PTHREAD_SEMANTICS; and minor changes
+
+	Red Hat issue 1182005: socat 1.7.2.4 build failure missing
+	linux/errqueue.h
+	Socat failed to compile on on PPC due to new requirements for
+	including <linux/errqueue.h> and a weakness in the conditional code.
+	Thanks to Michel Normand for reporting this issue.
+
+doc:
+	In the man page the PTY example was badly formatted. Thanks to
+	J.F.Sebastian for sending a patch.
+
+	Added missing CVE ids to security issues in CHANGES
+
+testing:
+	Do not distribute testcert.conf with socat source but generate it
+	(and new testcert6.conf) during test.sh run.
+
+####################### V 1.7.2.4:
+
+corrections:
+	LISTEN based addresses applied some address options, e.g. so-keepalive,
+	to the listening file descriptor instead of the connected file
+	descriptor
+	Thanks to Ulises Alonso for reporting this bug
+
+	make failed after configure with non gcc compiler due to missing
+	include. Thanks to Horacio Mijail for reporting this problem
+
+	configure checked for --disable-rawsocket but printed
+	--disable-genericsocket in the help text. Thanks to Ben Gardiner for
+	reporting and patching this bug
+
+	In xioshutdown() a wrong branch was chosen after RECVFROM type addresses.
+	Probably no impact.
+	Thanks to David Binderman for reproting this issue.
+
+	procan could not cleanly format ulimit values longer than 16 decimal
+	digits. Thanks to Frank Dana for providing a patch that increases field
+	width to 24 digits.
+
+	OPENSSL-CONNECT with bind option failed on some systems, eg.FreeBSD, with
+	"Invalid argument"
+	Thanks to Emile den Tex for reporting this bug.
+
+	Changed some variable definitions to make gcc -O2 aliasing checker happy
+	Thanks to Ilya Gordeev for reporting these warnings
+
+	On big endian platforms with type long >32bit the range option applied a
+	bad base address. Thanks to hejia hejia for reporting and fixing this bug.
+
+	Red Hat issue 1022070: missing length check in xiolog_ancillary_socket()
+
+	Red Hat issue 1022063: out-of-range shifts on net mask bits
+
+	Red Hat issue 1022062: strcpy misuse in xiosetsockaddrenv_ip4()
+
+	Red Hat issue 1022048: strncpy hardening: corrected suspicious strncpy()
+	uses
+
+	Red Hat issue 1021958: fixed a bug with faulty buffer/data length
+	calculation in xio-ascii.c:_xiodump()
+
+	Red Hat issue 1021972: fixed a missing NUL termination in return string
+	of sysutils.c:sockaddr_info() for the AF_UNIX case
+
+	fixed some typos and minor issues, including:
+	Red Hat issue 1021967: formatting error in manual page
+
+	UNIX-LISTEN with fork option did not remove the socket file system entry
+	when exiting. Other file system based passive address types had similar
+	issues or failed to apply options umask, user e.a.
+	Thanks to Lorenzo Monti for pointing me to this issue
+
+porting:
+	Red Hat issue 1020203: configure checks fail with some compilers.
+	Use case: clang
+
+	Performed changes for Fedora release 19
+
+	Adapted, improved test.sh script
+
+	Red Hat issue 1021429: getgroupent fails with large number of groups;
+	use getgrouplist() when available instead of sequence of calls to
+	getgrent()
+
+	Red Hat issue 1021948: snprintf API change;
+	Implemented xio_snprintf() function as wrapper that tries to emulate C99
+	behaviour on old glibc systems, and adapted all affected calls
+	appropriately
+
+	Mike Frysinger provided a patch that supports long long for time_t,
+	socklen_t and a few other libc types.
+
+	Artem Mygaiev extended Cedril Priscals Android build script with pty code
+
+	The check for fips.h required stddef.h
+	Thanks to Matt Hilt for reporting this issue and sending a patch
+
+	Check for linux/errqueue.h failed on some systems due to lack of
+	linux/types.h inclusion. Thanks to Michael Vastola for sending a patch.
+
+	autoconf now prefers configure.ac over configure.in
+	Thanks to Michael Vastola for sending a patch.
+
+	type of struct cmsghdr.cmsg is system dependend, determine it with
+	configure; some more print format corrections
+
+docu:
+	libwrap always logs to syslog
+
+	added actual text version of GPLv2
+
+####################### V 1.7.2.3:
+
+security:
+	CVE-2014-0019: socats PROXY-CONNECT address was vulnerable to a buffer
+	overflow with data from command line (see socat-secadv5.txt)
+	Credits to Florian Weimer of the Red Hat Product Security Team
+
 ####################### V 1.7.2.2:
 
 security:
+	CVE-2013-3571:
 	after refusing a client connection due to bad source address or source
 	port socat shutdown() the socket but did not close() it, resulting in
 	a file descriptor leak in the listening process, visible with lsof and
@@ -12,6 +258,7 @@ security:
 ####################### V 1.7.2.1:
 
 security:
+	CVE-2012-0219:
 	fixed a possible heap buffer overflow in the readline address. This bug
 	could be exploited when all of the following conditions were met:
 	1) one of the addresses is READLINE without the noprompt and without the
@@ -144,6 +391,7 @@ docu:
 ####################### V 1.7.1.3:
 
 security:
+	CVE-2010-2799:
 	fixed a stack overflow vulnerability that occurred when command
 	line arguments (whole addresses, host names, file names) were longer
 	than 512 bytes.
@@ -643,7 +891,8 @@ further corrections:
 
 ####################### V 1.4.0.3:
 
-corrections:
+security:
+	CVE-2004-1484:
 	fix to a syslog() based format string vulnerability that can lead to
 	remote code execution. See advisory socat-adv-1.txt
 
@@ -877,7 +1126,7 @@ further corrections:
 	ftp.sh script supports proxy address
 
 	man page no longer installed with execute permissions (thanks to Peter
-        Bray) 
+	Bray) 
 
 	fixed a malloc call bug that could cause SIGSEGV or false "out of
 	memory" errors on EXEC and SYSTEM, depending on program name length and

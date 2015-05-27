@@ -1,5 +1,5 @@
 /* source: sysutils.c */
-/* Copyright Gerhard Rieger 2001-2011 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 /* translate socket addresses into human readable form */
@@ -163,6 +163,9 @@ socklen_t socket_init(int af, union sockaddr_union *sa) {
 #endif
 
 #if _WITH_SOCKET
+/* writes a textual human readable representation of the sockaddr contents to buff and returns a pointer to buff
+   writes at most blen bytes to buff including the terminating \0 byte
+ */
 char *sockaddr_info(const struct sockaddr *sa, socklen_t salen, char *buff, size_t blen) {
    union sockaddr_union *sau = (union sockaddr_union *)sa;
    char *lbuff = buff;
@@ -170,14 +173,16 @@ char *sockaddr_info(const struct sockaddr *sa, socklen_t salen, char *buff, size
    int n;
 
 #if HAVE_STRUCT_SOCKADDR_SALEN
-   if ((n = snprintf(cp, blen, "LEN=%d ", sau->soa.sa_len)) < 0) {
+   n = xio_snprintf(cp, blen, "LEN=%d ", sau->soa.sa_len);
+   if (n < 0 || n >= blen) {
       Warn1("sockaddr_info(): buffer too short ("F_Zu")", blen);
       *buff = '\0';
       return buff;
    }
    cp += n,  blen -= n;
 #endif
-   if ((n = snprintf(cp, blen, "AF=%d ", sau->soa.sa_family)) < 0) {
+   n = xio_snprintf(cp, blen, "AF=%d ", sau->soa.sa_family);
+   if (n < 0 || n >= blen) {
       Warn1("sockaddr_info(): buffer too short ("F_Zu")", blen);
       *buff = '\0';
       return buff;
@@ -189,7 +194,7 @@ char *sockaddr_info(const struct sockaddr *sa, socklen_t salen, char *buff, size
    case 0:
    case AF_UNIX: sockaddr_unix_info(&sau->un, salen, cp+1, blen-1);
       cp[0] = '"';
-      *strchr(cp+1, '\0') = '"';
+      strncat(cp+1, "\"", 1);
       break;
 #endif
 #if WITH_IP4
@@ -201,13 +206,14 @@ char *sockaddr_info(const struct sockaddr *sa, socklen_t salen, char *buff, size
       break;
 #endif
    default:
-      if ((n = snprintf(cp, blen, "AF=%d ", sa->sa_family)) < 0) {
+      n = xio_snprintf(cp, blen, "AF=%d ", sa->sa_family);
+      if (n < 0 || n >= blen) {
 	 Warn1("sockaddr_info(): buffer too short ("F_Zu")", blen);
 	 *buff = '\0';
 	 return buff;
       }
       cp += n,  blen -= n;
-      if ((snprintf(cp, blen,
+      n = xio_snprintf(cp, blen,
 		    "0x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
 		    ((unsigned char *)sau->soa.sa_data)[0],
 		    ((unsigned char *)sau->soa.sa_data)[1],
@@ -222,7 +228,8 @@ char *sockaddr_info(const struct sockaddr *sa, socklen_t salen, char *buff, size
 		    ((unsigned char *)sau->soa.sa_data)[10],
 		    ((unsigned char *)sau->soa.sa_data)[11],
 		    ((unsigned char *)sau->soa.sa_data)[12],
-		    ((unsigned char *)sau->soa.sa_data)[13])) < 0) {
+		   ((unsigned char *)sau->soa.sa_data)[13]);
+      if (n < 0 || n >= blen) {
 	 Warn("sockaddr_info(): buffer too short");
 	 *buff = '\0';
 	 return buff;
@@ -244,8 +251,6 @@ char *sockaddr_unix_info(const struct sockaddr_un *sa, socklen_t salen, char *bu
       nextc =
 	 sanitize_string(sa->sun_path, salen-XIOUNIXSOCKOVERHEAD,
 			 ubuff, XIOSAN_DEFAULT_BACKSLASH_OCT_3);
-      *nextc = '\0';
-      strncpy(buff, ubuff, blen);
    } else
 #endif /* WITH_ABSTRACT_UNIXSOCKET */
    {
@@ -257,9 +262,9 @@ char *sockaddr_unix_info(const struct sockaddr_un *sa, socklen_t salen, char *bu
 				 MIN(UNIX_PATH_MAX, strlen(sa->sun_path)),
 				 ubuff, XIOSAN_DEFAULT_BACKSLASH_OCT_3);
       }
-      *nextc = '\0';
-      strncpy(buff, ubuff, blen);
    }
+   *nextc = '\0';
+   buff[0] = '\0'; strncat(buff, ubuff, blen-1);
    return buff;
 }
 #endif /* WITH_UNIX */
@@ -267,9 +272,9 @@ char *sockaddr_unix_info(const struct sockaddr_un *sa, socklen_t salen, char *bu
 #if WITH_IP4
 /* addr in host byte order! */
 char *inet4addr_info(uint32_t addr, char *buff, size_t blen) {
-   if (snprintf(buff, blen, "%u.%u.%u.%u",
+   if (xio_snprintf(buff, blen, "%u.%u.%u.%u",
 		(unsigned int)(addr >> 24), (unsigned int)((addr >> 16) & 0xff),
-		(unsigned int)((addr >> 8) & 0xff), (unsigned int)(addr & 0xff)) < 0) {
+		(unsigned int)((addr >> 8) & 0xff), (unsigned int)(addr & 0xff)) >= blen) {
       Warn("inet4addr_info(): buffer too short");
       buff[blen-1] = '\0';
    }
@@ -279,12 +284,12 @@ char *inet4addr_info(uint32_t addr, char *buff, size_t blen) {
 
 #if WITH_IP4
 char *sockaddr_inet4_info(const struct sockaddr_in *sa, char *buff, size_t blen) {
-   if (snprintf(buff, blen, "%u.%u.%u.%u:%hu",
+   if (xio_snprintf(buff, blen, "%u.%u.%u.%u:%hu",
 		((unsigned char *)&sa->sin_addr.s_addr)[0],
 		((unsigned char *)&sa->sin_addr.s_addr)[1],
 		((unsigned char *)&sa->sin_addr.s_addr)[2],
 		((unsigned char *)&sa->sin_addr.s_addr)[3],
-		htons(sa->sin_port)) < 0) {
+		htons(sa->sin_port)) >= blen) {
       Warn("sockaddr_inet4_info(): buffer too short");
       buff[blen-1] = '\0';
    }
@@ -300,19 +305,19 @@ const char *inet_ntop(int pf, const void *binaddr,
    switch (pf) {
    case PF_INET:
       if ((retlen =
-	   snprintf(addrtext, textlen, "%u.%u.%u.%u",
+	   xio_snprintf(addrtext, textlen, "%u.%u.%u.%u",
 		    ((unsigned char *)binaddr)[0],
 		    ((unsigned char *)binaddr)[1],
 		    ((unsigned char *)binaddr)[2],
 		    ((unsigned char *)binaddr)[3]))
-	  < 0) {
-	 return NULL;	/* errno is valid */
+	  >= textlen) {
+	 errno = ENOSPC; return NULL;
       }
       break;
 #if WITH_IP6
    case PF_INET6:
       if ((retlen =
-	   snprintf(addrtext, textlen, "%x:%x:%x:%x:%x:%x:%x:%x",
+	   xio_snprintf(addrtext, textlen, "%x:%x:%x:%x:%x:%x:%x:%x",
 		    ntohs(((uint16_t *)binaddr)[0]),
 		    ntohs(((uint16_t *)binaddr)[1]),
 		    ntohs(((uint16_t *)binaddr)[2]),
@@ -322,8 +327,8 @@ const char *inet_ntop(int pf, const void *binaddr,
 		    ntohs(((uint16_t *)binaddr)[6]),
 		    ntohs(((uint16_t *)binaddr)[7])
 		    ))
-	  < 0) {
-	 return NULL;	/* errno is valid */
+	  >= textlen) {
+	 errno = ENOSPC; return NULL;
       }
       break;
 #endif /* WITH_IP6 */
@@ -340,7 +345,7 @@ const char *inet_ntop(int pf, const void *binaddr,
 /* convert the IP6 socket address to human readable form. buff should be at
    least 50 chars long. output includes the port number */
 char *sockaddr_inet6_info(const struct sockaddr_in6 *sa, char *buff, size_t blen) {
-   if (snprintf(buff, blen, "[%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x]:%hu",
+   if (xio_snprintf(buff, blen, "[%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x]:%hu",
 #if HAVE_IP6_SOCKADDR==0
 		(sa->sin6_addr.s6_addr[0]<<8)+
 		sa->sin6_addr.s6_addr[1],
@@ -404,23 +409,56 @@ char *sockaddr_inet6_info(const struct sockaddr_in6 *sa, char *buff, size_t blen
 		ntohs(((unsigned short *)&sa->sin6_addr.__u6_addr.__u6_addr16)[6]),
 		ntohs(((unsigned short *)&sa->sin6_addr.__u6_addr.__u6_addr16)[7]),
 #endif
-		ntohs(sa->sin6_port)) < 0) {
+		ntohs(sa->sin6_port)) >= blen) {
       Warn("sockaddr_inet6_info(): buffer too short");
-      buff[blen-1] = '\0';
    }
    return buff;
 }
 #endif /* WITH_IP6 */
 
-#if defined(HAVE_SETGRENT) && defined(HAVE_GETGRENT) && defined(HAVE_ENDGRENT)
-/* fill the list with the supplementary group ids of user.
+#if HAVE_GETGROUPLIST || (defined(HAVE_SETGRENT) && defined(HAVE_GETGRENT) && defined(HAVE_ENDGRENT))
+/* fills the list with the supplementary group ids of user.
    caller passes size of list in ngroups, function returns number of groups in
    ngroups.
    function returns 0 if 0 or more groups were found, or 1 if the list is too
    short. */
-int getusergroups(const char *user, gid_t *list, size_t *ngroups) {
+int getusergroups(const char *user, gid_t *list, int *ngroups) {
+#if HAVE_GETGROUPLIST
+   /* we prefer getgrouplist because it may be much faster with many groups, but it is not standard */
+   gid_t grp, twogrps[2];
+   int two = 2;
+   /* getgrouplist requires to pass an extra group id, typically the users primary group, that is then added to the supplementary group list. We don't want such an additional group in the result, but there is not "unspecified" gid value available. Thus we try to find an abitrary supplementary group id that we then pass in a second call to getgrouplist. */
+   grp = 0;
+   Getgrouplist(user, grp, twogrps, &two);
+   if (two == 1) {
+      /* either user has just this supp group, or none; we try another id */
+      grp = 1; two = 2;
+      Getgrouplist(user, grp, twogrps, &two);
+      if (two == 1) {
+	 /* user has no supp group */
+	 *ngroups = 0;
+	 return 0;
+      }
+      /* user has just the first tried group */
+      *ngroups = 1; list[0] = grp;
+      return 0;
+   }
+   /* find the first supp group that is not our grp, and use its id */
+   if (twogrps[0] == grp) {
+      grp = twogrps[1];
+   } else {
+      grp = twogrps[0];
+   }
+   if (Getgrouplist(user, grp, list, ngroups) < 0) {
+      return 1;
+   }
+   return 0;
+
+#elif defined(HAVE_SETGRENT) && defined(HAVE_GETGRENT) && defined(HAVE_ENDGRENT)
+   /* this is standard (POSIX) but may be slow */
+
    struct group *grp;
-   size_t i = 0;
+   int i = 0;
 
    setgrent();
    while (grp = getgrent()) {
@@ -438,6 +476,7 @@ int getusergroups(const char *user, gid_t *list, size_t *ngroups) {
    endgrent();
    *ngroups = i;
    return 0;
+#endif /* HAVE_SETGRENT... */
 }
 #endif
 
@@ -575,7 +614,7 @@ int ifindexbyname(const char *ifname, int anysock) {
       return -1;
    }
 
-   strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+   strncpy(ifr.ifr_name, ifname, IFNAMSIZ);	/* ok */
    if (Ioctl(s, SIOCGIFINDEX, &ifr) < 0) {
       Info3("ioctl(%d, SIOCGIFINDEX, {\"%s\"}): %s",
 	     s, ifr.ifr_name, strerror(errno));
@@ -627,23 +666,19 @@ int ifindex(const char *ifname, unsigned int *ifindex, int anysock) {
 #endif /* WITH_IP4 || WITH_IP6 || WITH_INTERFACE */
 
 
-/* constructs an environment variable whose name is built from socats uppercase
-   program name, and underscore and varname; if a variable of this name already
-   exists a non zero value of overwrite lets the old value be overwritten.
-   returns 0 on success or <0 if an error occurred. */
-int xiosetenv(const char *varname, const char *value, int overwrite) {
-#  define XIO_ENVNAMELEN 256
-   const char *progname;
-   char envname[XIO_ENVNAMELEN];
-   size_t i, l;
-
-   progname = diag_get_string('p');
-   strncpy(envname, progname, XIO_ENVNAMELEN-1);
-   l = strlen(progname);
-   strncpy(envname+l, "_", XIO_ENVNAMELEN-1-l);
-   for (i = 0; i < l; ++i)  envname[i] = toupper(envname[i]);
-   strncpy(envname+l+1, varname, XIO_ENVNAMELEN-1-l);
-   if (Setenv(envname, value, overwrite) < 0) {
+int _xiosetenv(const char *envname, const char *value, int overwrite, const char *sep) {
+   char *oldval;
+   char *newval;
+   if (overwrite >= 2 && (oldval = getenv(envname)) != NULL) {
+      size_t newlen = strlen(oldval)+strlen(sep)+strlen(value)+1;
+      if ((newval = Malloc(newlen+1)) == NULL) {
+	 return -1;
+      }
+      snprintf(newval, newlen+1, "%s%s%s", oldval, sep, value);
+   } else {
+      newval = (char *)value;
+   }
+   if (Setenv(envname, newval, overwrite) < 0) {
       Warn3("setenv(\"%s\", \"%s\", 1): %s",
 	    envname, value, strerror(errno));
 #if HAVE_UNSETENV
@@ -652,37 +687,81 @@ int xiosetenv(const char *varname, const char *value, int overwrite) {
       return -1;
    }
    return 0;
-#  undef XIO_ENVNAMELEN
+}
+
+/* constructs an environment variable whose name is built from socats uppercase
+   program name, and underscore and varname;
+   if the variable of this name already exists arg overwrite determines:
+   0: keep old value
+   1: overwrite with new value
+   2: append to old value, separated by *sep
+a non zero value of overwrite lets the old value be overwritten.
+   returns 0 on success or <0 if an error occurred. */
+int xiosetenv(const char *varname, const char *value, int overwrite, const char *sep) {
+#  define XIO_ENVNAMELEN 256
+   const char *progname;
+   char envname[XIO_ENVNAMELEN];
+   size_t i, l;
+
+   progname = diag_get_string('p');
+   envname[0] = '\0'; strncat(envname, progname, XIO_ENVNAMELEN-1);
+   l = strlen(envname);
+   for (i = 0; i < l; ++i)  envname[i] = toupper(envname[i]);
+   strncat(envname+l, "_", XIO_ENVNAMELEN-l-1);
+   l += 1;
+   strncat(envname+l, varname, XIO_ENVNAMELEN-l-1);
+   return _xiosetenv(envname, value, overwrite, sep);
+#  undef ENVNAMELEN
 }
 
 int xiosetenv2(const char *varname, const char *varname2, const char *value,
-	       int overwrite) {
+	       int overwrite, const char *sep) {
 #  define XIO_ENVNAMELEN 256
    const char *progname;
    char envname[XIO_ENVNAMELEN];
    size_t i, l;
 
    progname = diag_get_string('p');
-   strncpy(envname, progname, XIO_ENVNAMELEN-1);
+   envname[0] = '\0'; strncat(envname, progname, XIO_ENVNAMELEN-1);
    l = strlen(progname);
-   strncpy(envname+l, "_", XIO_ENVNAMELEN-1-l);
+   strncat(envname+l, "_", XIO_ENVNAMELEN-l-1);
    l += 1;
-   strncpy(envname+l, varname, XIO_ENVNAMELEN-1-l);
-   l += strlen(varname);
-   strncpy(envname+l, "_", XIO_ENVNAMELEN-1-l);
+   strncat(envname+l, varname, XIO_ENVNAMELEN-l-1);
+   l += strlen(envname+l);
+   strncat(envname+l, "_", XIO_ENVNAMELEN-l-1);
    l += 1;
-   strncpy(envname+l, varname2, XIO_ENVNAMELEN-1-l);
-   l += strlen(varname2);
+   strncat(envname+l, varname2, XIO_ENVNAMELEN-l-1);
+   l += strlen(envname+l);
    for (i = 0; i < l; ++i)  envname[i] = toupper(envname[i]);
-   if (Setenv(envname, value, overwrite) < 0) {
-      Warn3("setenv(\"%s\", \"%s\", 1): %s",
-	    envname, value, strerror(errno));
-#if HAVE_UNSETENV
-      Unsetenv(envname);      /* dont want to have a wrong value */
-#endif
-      return -1;
-   }
-   return 0;
+   return _xiosetenv(envname, value, overwrite, sep);
+#  undef XIO_ENVNAMELEN
+}
+
+int xiosetenv3(const char *varname, const char *varname2, const char *varname3,
+	       const char *value,
+	       int overwrite, const char *sep) {
+#  define XIO_ENVNAMELEN 256
+   const char *progname;
+   char envname[XIO_ENVNAMELEN];
+   size_t i, l;
+
+   progname = diag_get_string('p');
+   envname[0] = '\0'; strncat(envname, progname, XIO_ENVNAMELEN-1);
+   l = strlen(progname);
+   strncat(envname+l, "_", XIO_ENVNAMELEN-l-1);
+   l += 1;
+   strncat(envname+l, varname, XIO_ENVNAMELEN-l-1);
+   l += strlen(envname+l);
+   strncat(envname+l, "_", XIO_ENVNAMELEN-l-1);
+   l += 1;
+   strncat(envname+l, varname2, XIO_ENVNAMELEN-l-1);
+   l += strlen(envname+l);
+   strncat(envname+l, "_", XIO_ENVNAMELEN-l-1);
+   l += 1;
+   strncat(envname+l, varname3, XIO_ENVNAMELEN-l-1);
+   l += strlen(envname+l);
+   for (i = 0; i < l; ++i)  envname[i] = toupper(envname[i]);
+   return _xiosetenv(envname, value, overwrite, sep);
 #  undef XIO_ENVNAMELEN
 }
 
@@ -693,7 +772,7 @@ int xiosetenvulong(const char *varname, unsigned long value, int overwrite) {
    char envbuff[XIO_LONGLEN];
 
    snprintf(envbuff, XIO_LONGLEN, "%lu", value);
-   return xiosetenv(varname, envbuff, overwrite);
+   return xiosetenv(varname, envbuff, overwrite, NULL);
 #  undef XIO_LONGLEN
 }
 
@@ -703,6 +782,6 @@ int xiosetenvushort(const char *varname, unsigned short value, int overwrite) {
    char envbuff[XIO_SHORTLEN];
 
    snprintf(envbuff, XIO_SHORTLEN, "%hu", value);
-   return xiosetenv(varname, envbuff, overwrite);
+   return xiosetenv(varname, envbuff, overwrite, NULL);
 #  undef XIO_SHORTLEN
 }

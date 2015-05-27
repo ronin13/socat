@@ -10,7 +10,7 @@ def(Filan)(0)(bf(Filan))
 def(procan)(0)(bf(procan))
 def(Procan)(0)(bf(Procan))
 
-manpage(socat)(1)(Dec 2011)()()
+manpage(socat)(1)()()()
 
 whenhtml(
 label(CONTENTS)
@@ -119,12 +119,16 @@ dit(bf(tt(-D)))
 dit(bf(tt(-ly[<facility>])))
    Writes messages to syslog instead of stderr; severity as defined with -d
    option. With optional link(<facility>)(TYPE_FACILITY), the syslog type can
-   be selected, default is "daemon". 
+   be selected, default is "daemon". Third party libraries might not obey this
+   option.
 dit(bf(tt(-lf))tt( <logfile>))
    Writes messages to <logfile> [link(filename)(TYPE_FILENAME)] instead of
-   stderr. 
+   stderr. Some third party libraries, in particular libwrap, might not obey
+   this option.
 dit(bf(tt(-ls)))
-   Writes messages to stderr (this is the default).
+   Writes messages to stderr (this is the default). Some third party libraries 
+   might not obey this option, in particular libwrap appears to only log to
+   syslog. 
 label(option_lp)dit(bf(tt(-lp))tt(<progname>))
    Overrides the program name printed in error messages and used for
    constructing environment variable names.
@@ -488,14 +492,23 @@ label(ADDRESS_OPENSSL_CONNECT)dit(bf(tt(OPENSSL:<host>:<port>)))
    <host> [link(IP address)(TYPE_IP_ADDRESS)] using TCP/IP version 4 or 6
    depending on address specification, name resolution, or option
    link(pf)(OPTION_PROTOCOL_FAMILY).nl()
-   NOTE: The server certificate is only checked for validity against
-   link(cafile)(OPTION_OPENSSL_CAFILE) or link(capath)(OPTION_OPENSSL_CAPATH),
-   but not for match with the server's name or its IP address!nl() 
+   NOTE: Up to version 1.7.2.4
+   the server certificate was only checked for validity against the system
+   certificate store or link(cafile)(OPTION_OPENSSL_CAFILE) or
+   link(capath)(OPTION_OPENSSL_CAPATH),
+   but not for match with the server's name or its IP address.
+   Since version 1.7.3.0 socat checks the peer certificate for match with the
+   <host> parameter or the value of the 
+   link(openssl-commonname)(OPTION_OPENSSL_COMMONNAME) option.
+   Socat tries to match it against the certificates subject commonName,
+   and the certifications extension subjectAltName DNS names. Wildcards in the
+   certificate are supported.nl() 
    Option groups: link(FD)(GROUP_FD),link(SOCKET)(GROUP_SOCKET),link(IP4)(GROUP_IP4),link(IP6)(GROUP_IP6),link(TCP)(GROUP_TCP),link(OPENSSL)(GROUP_OPENSSL),link(RETRY)(GROUP_RETRY) nl()
    Useful options:
    link(cipher)(OPTION_OPENSSL_CIPHERLIST),
    link(method)(OPTION_OPENSSL_METHOD),
    link(verify)(OPTION_OPENSSL_VERIFY),
+   link(commonname)(OPTION_OPENSSL_COMMONNAME)
    link(cafile)(OPTION_OPENSSL_CAFILE),
    link(capath)(OPTION_OPENSSL_CAPATH),
    link(certificate)(OPTION_OPENSSL_CERTIFICATE),
@@ -524,6 +537,7 @@ label(ADDRESS_OPENSSL_LISTEN)dit(bf(tt(OPENSSL-LISTEN:<port>)))
    link(cipher)(OPTION_OPENSSL_CIPHERLIST),
    link(method)(OPTION_OPENSSL_METHOD),
    link(verify)(OPTION_OPENSSL_VERIFY),
+   link(commonname)(OPTION_OPENSSL_COMMONNAME)
    link(cafile)(OPTION_OPENSSL_CAFILE),
    link(capath)(OPTION_OPENSSL_CAPATH),
    link(certificate)(OPTION_OPENSSL_CERTIFICATE),
@@ -1704,7 +1718,8 @@ label(OPTION_SUBSTUSER)dit(bf(tt(su=<user>)))
    Changes the link(<user>)(TYPE_USER) (owner) and groups of the process after
    processing the address (link(example)(EXAMPLE_OPTION_SUBSTUSER)). This call might require root privilege. 
 label(OPTION_SUBSTUSER_DELAYED)dit(bf(tt(su-d=<user>)))
-   Short name for bf(tt(substuser-delayed)). 
+   Short name for tt(substuser-delayed).
+   COMMENT(Short name for bf(tt(substuser-delayed) ).)
    Changes the link(<user>)(TYPE_USER)
    (owner) and groups of the process after processing the address (link(example)(EXAMPLE_OPTION_SUBSTUSER_DELAYED)).
    The user and his groups are retrieved em(before) a possible
@@ -2306,6 +2321,8 @@ label(OPTION_FORK)dit(bf(tt(fork)))
 SSL-LISTEN forks em(before) the SSL handshake, while SSL-CONNECT forks
 em(afterwards).
    RETRY and FOREVER options are not inherited by the child process.nl()
+   On some operating systems (e.g. FreeBSD) this option does not work for
+   UDP-LISTEN addresses.nl()
 enddit()
 
 startdit()enddit()nl()
@@ -2409,12 +2426,16 @@ Note: On some operating systems, these options may not be
 available. Use link(ispeed)(OPTION_ISPEED) or link(ospeed)(OPTION_OSPEED)
 instead.
 label(OPTION_ECHO)dit(bf(tt(echo=<bool>)))
-   Enables or disables local echo (link(example)(EXAMPLE_OPTION_ECHO)).
+   Enables or disables local echo.
 label(OPTION_ICANON)dit(bf(tt(icanon=<bool>)))
    Sets or clears canonical mode, enabling line buffering and some special
    characters. 
 label(OPTION_RAW)dit(bf(tt(raw)))
-   Sets raw mode, thus passing input and output almost unprocessed (link(example)(EXAMPLE_OPTION_RAW)).
+   Sets raw mode, thus passing input and output almost unprocessed. This option is obsolete, use option link(rawer)(OPTION_TERMIOS_RAWER) or link(cfmakeraw)(OPTION_TERMIOS_CFMAKERAW) instead.
+label(OPTION_TERMIOS_RAWER)dit(bf(tt(rawer)))
+   Makes terminal rawer than link(raw)(OPTION_RAW) option. This option implicitly turns off echo. (link(example)(EXAMPLE_OPTION_TERMIOS_RAWER)).
+label(OPTION_TERMIOS_CFMAKERAW)dit(bf(tt(cfmakeraw)))
+   Sets raw mode by invoking tt(cfmakeraw()) or by simulating this call. This option implicitly turns off echo.
 label(OPTION_IGNBRK)dit(bf(tt(ignbrk=<bool>)))
    Ignores or interpretes the BREAK character (e.g., ^C)
 label(OPTION_BRKINT)dit(bf(tt(brkint=<bool>)))
@@ -2618,11 +2639,14 @@ label(OPTION_OPENSSL_METHOD)dit(bf(tt(method=<ssl-method>)))
    Sets the protocol version to be used. Valid strings (not case sensitive)
    are:  
    startdit()
-   dit(tt(SSLv2)) Select SSL protocol version 2.
-   dit(tt(SSLv3)) Select SSL protocol version 3.
-   dit(tt(SSLv23)) Select SSL protocol version 2 or 3. This is the default when
+   dit(tt(SSL2)) Select SSL protocol version 2.
+   dit(tt(SSL3)) Select SSL protocol version 3.
+   dit(tt(SSL23)) Select the best available SSL or TLS protocol. This is the default when
    this option is not provided.
-   dit(tt(TLSv1)) Select TLS protocol version 1.
+   dit(tt(TLS1)) Select TLS protocol version 1.
+   dit(tt(TLS1.1)) Select TLS protocol version 1.1.
+   dit(tt(TLS1.2)) Select TLS protocol version 1.2.
+   dit(tt(DTLS1)) Select DTLS protocol version 1.
    enddit()
 label(OPTION_OPENSSL_VERIFY)dit(bf(tt(verify=<bool>)))
    Controls check of the peer's certificate. Default is 1 (true). Disabling
@@ -2668,6 +2692,14 @@ label(OPTION_OPENSSL_COMPRESS)dit(bf(tt(compress)))
    compression-related settings.
    NOTE: Requires OpenSSL 0.9.8 or higher and disabling compression with
    OpenSSL 0.9.8 affects all new connections in the process.
+label(OPTION_OPENSSL_COMMONNAME)dit(bf(tt(commonname=<string>)))
+   Specify the commonname that the peer certificate must match. With
+   link(OPENSSL-CONNECT)(ADDRESS_OPENSSL_CONNECT) address this overrides the
+   given hostname or IP target address; with
+   link(OPENSSL-LISTEN)(ADDRESS_OPENSSL_LISTEN) this turns on check of peer
+   certificates commonname. This option has only meaning when option
+   link(verify)(OPTION_OPENSSL_VERIFY) is not disabled and the choosen cipher
+   provides a peer certificate.
 label(OPTION_OPENSSL_FIPS)dit(bf(tt(fips)))
    Enables FIPS mode if compiled in. For info about the FIPS encryption
    implementation standard see lurl(http://oss-institute.org/fips-faq.html). 
@@ -2993,13 +3025,12 @@ at most 512 data bytes per packet (link(mss)(OPTION_MSS)).
 
 
 label(EXAMPLE_ADDRESS_GOPEN)
-label(EXAMPLE_OPTION_RAW)
-label(EXAMPLE_OPTION_ECHO)
+label(EXAMPLE_OPTION_TERMIOS_RAWER)
 label(EXAMPLE_OPTION_ESCAPE)
-dit(bf(tt(socat -,raw,echo=0,escape=0x0f /dev/ttyS0,raw,echo=0,crnl)))
+dit(bf(tt(socat -,escape=0x0f /dev/ttyS0,rawer,crnl)))
 
 opens an interactive connection via the serial line, e.g. for talking with a
-modem. link(raw)(OPTION_RAW) and link(echo)(OPTION_ECHO) set the console's and
+modem. link(rawer)(OPTION_TERMIOS_RAWER) sets the console's and
 ttyS0's terminal parameters to practicable values, link(crnl)(OPTION_CRNL) 
 converts to correct newline characters. link(escape)(OPTION_ESCAPE) allows to
 terminate the socat process with character control-O. 
@@ -3120,14 +3151,21 @@ label(EXAMPLE_ADDRESS_PTY)
 label(EXAMPLE_OPTION_SYMBOLIC_LINK)
 label(EXAMPLE_OPTION_WAIT_SLAVE)
 label(EXAMPLE_OPTION_NONBLOCK)
-(bf(tt(socat PTY,link=$HOME/dev/vmodem0,raw,echo=0,wait-slave EXEC:'"ssh modemserver.us.org socat - /dev/ttyS0,nonblock,raw,echo=0"')))
+mancommand(\.LP)
+mancommand(\.nf)
+mancommand(\fBsocat PTY,link=$HOME/dev/vmodem0,rawer,wait-slave \\\bf)
+mancommand(\fBEXEC:"ssh modemserver.us.org socat - /dev/ttyS0,nonblock,rawer"\fP)
+mancommand(\.fi)
+
+htmlcommand(<dt><code><strong>socat PTY,link=$HOME/dev/vmodem0,rawer,wait-slave \</strong><br>
+<strong>EXEC:'"ssh modemserver.us.org socat - /dev/ttyS0,nonblock,rawer"'</strong></code><dd>)
 
 generates a pseudo terminal 
 device (link(PTY)(ADDRESS_PTY)) on the client that can be reached under the
 symbolic link(link)(OPTION_SYMBOLIC_LINK) file($HOME/dev/vmodem0). 
 An application that expects a serial line or modem
 can be configured to use file($HOME/dev/vmodem0); its traffic will be directed
-to a modemserver via ssh where another socat instance links it with
+to a modemserver via ssh where another socat instance links it to
 file(/dev/ttyS0).
 
 
@@ -3259,7 +3297,7 @@ may thus cause packet loss.
 
 
 label(EXAMPLE_INTERFACE)
-dit(bf(tt(socat PTY,link=/var/run/ppp,raw,echo=0 INTERFACE:hdlc0)))
+dit(bf(tt(socat PTY,link=/var/run/ppp,rawer INTERFACE:hdlc0)))
 
 circumvents the problem that pppd requires a serial device and thus might not
 be able to work on a synchronous line that is represented by a network device.
@@ -3433,6 +3471,16 @@ dit(bf(SOCAT_IPV6_TCLASS) (output)) With all IPv6 based RECVFROM addresses
 where address option link(ipv6-recvtclass)(OPTION_IPV6_RECVTCLASS) is applied,
 socat sets this variable to the transfer class of the received packet.
 
+dit(bf(SOCAT_OPENSSL_X509_ISSUER) (output)) Issuer field from peer certificate
+
+dit(bf(SOCAT_OPENSSL_X509_SUBJECT) (output)) Subject field from peer certificate
+
+dit(bf(SOCAT_OPENSSL_X509_COMMONNAME) (output)) commonName entries from peer certificates subject. Multiple values are separated by " // ".
+
+dit(bf(SOCAT_OPENSSL_X509_*) (output)) all other entries from peer certificates subject
+
+dit(bf(SOCAT_OPENSSL_X509V3_DNS) (output)) DNS entries from peer certificates extensions - subjectAltName field. Multiple values are separated by " // ".
+
 dit(bf(HOSTNAME) (input)) Is used to determine the hostname for logging (see
 link(-lh)(option_lh)).
 
@@ -3482,7 +3530,7 @@ standard specifications available on the Internet for free.
 label(VERSION)
 manpagesection(VERSION)
 
-This man page describes version 1.7.2 of socat().
+This man page describes version 1.7.3 of socat().
 
 
 label(BUGS)

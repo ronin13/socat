@@ -1,5 +1,5 @@
 /* source: utils.h */
-/* Copyright Gerhard Rieger 2001-2008 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 #ifndef __utils_h_included
@@ -11,7 +11,7 @@ struct wordent {
    void *desc;
 } ;
 
-#if !HAVE_MEMRCHR
+#if !HAVE_PROTOTYPE_LIB_memrchr
 extern void *memrchr(const void *s, int c, size_t n);
 #endif
 extern void *memdup(const void *src, size_t n);
@@ -65,5 +65,8 @@ char *sanitize_string(const char *data,	/* input data */
 		   int style);
 extern
 char *xiosubstr(char *scratch, const char *str, size_t from, size_t len);
+
+extern
+int xio_snprintf(char *str, size_t size, const char *format, ...);
 
 #endif /* !defined(__utils_h_included) */

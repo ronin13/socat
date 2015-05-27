@@ -1,5 +1,5 @@
 /* source: xio-socket.c */
-/* Copyright Gerhard Rieger 2001-2011 */
+/* Copyright Gerhard Rieger */
 /* Published under the GNU General Public License V.2, see file COPYING */
 
 /* this file contains the source for socket related functions, and the
@@ -85,7 +85,7 @@ const struct optdesc opt_so_debug    = { "so-debug",    "debug", OPT_SO_DEBUG,  
 const struct optdesc opt_so_acceptconn={ "so-acceptconn","acceptconn",OPT_SO_ACCEPTCONN,GROUP_SOCKET,PH_PASTSOCKET,TYPE_INT,  OFUNC_SOCKOPT, SOL_SOCKET, SO_ACCEPTCONN};
 #endif /* SO_ACCEPTCONN */
 const struct optdesc opt_so_broadcast= { "so-broadcast", "broadcast", OPT_SO_BROADCAST,GROUP_SOCKET, PH_PASTSOCKET, TYPE_INT,  OFUNC_SOCKOPT, SOL_SOCKET, SO_BROADCAST};
-const struct optdesc opt_so_reuseaddr= { "so-reuseaddr", "reuseaddr", OPT_SO_REUSEADDR,GROUP_SOCKET, PH_PASTSOCKET, TYPE_INT,  OFUNC_SOCKOPT, SOL_SOCKET, SO_REUSEADDR};
+const struct optdesc opt_so_reuseaddr= { "so-reuseaddr", "reuseaddr", OPT_SO_REUSEADDR,GROUP_SOCKET, PH_PREBIND, TYPE_INT,  OFUNC_SOCKOPT, SOL_SOCKET, SO_REUSEADDR};
 const struct optdesc opt_so_keepalive= { "so-keepalive", "keepalive", OPT_SO_KEEPALIVE,GROUP_SOCKET, PH_FD, TYPE_INT,  OFUNC_SOCKOPT, SOL_SOCKET, SO_KEEPALIVE};
 #if HAVE_STRUCT_LINGER
 const struct optdesc opt_so_linger   = { "so-linger",    "linger",    OPT_SO_LINGER,   GROUP_SOCKET, PH_PASTSOCKET, TYPE_LINGER,OFUNC_SOCKOPT,SOL_SOCKET, SO_LINGER };
@@ -1055,7 +1055,7 @@ int _xioopen_dgram_sendto(/* them is already in xfd->peersa */
 
    if (us) {
       if (Bind(xfd->fd, (struct sockaddr *)us, uslen) < 0) {
-	 Msg4(level, "bind(%d, {%s}, "F_Zd"): %s",
+	 Msg4(level, "bind(%d, {%s}, "F_socklen"): %s",
 	      xfd->fd, sockaddr_info((struct sockaddr *)us, uslen, infobuff, sizeof(infobuff)),
 	      uslen, strerror(errno));
 	 Close(xfd->fd);
@@ -1099,7 +1099,7 @@ int _xioopen_dgram_sendto(/* them is already in xfd->peersa */
    handler sets xio_hashappened if the pid matched.
 */
 static pid_t xio_waitingfor;	/* info from recv loop to signal handler:
-				   indicates the pid that of the child process
+				   indicates the pid of the child process
 				   that should send us the USR1 signal */
 static bool xio_hashappened;	/* info from signal handler to loop: child
 				   process has read ("consumed") the packet */
@@ -1113,6 +1113,9 @@ void xiosigaction_hasread(int signum
    int _errno;
    int status = 0;
    bool wassig = false;
+
+   _errno = errno;
+   diag_in_handler = 1;
 #if HAVE_STRUCT_SIGACTION_SA_SIGACTION && defined(SA_SIGINFO)
    Debug5("xiosigaction_hasread(%d, {%d,%d,%d,"F_pid"}, )",
 	  signum, siginfo->si_signo, siginfo->si_errno, siginfo->si_code,
@@ -1121,35 +1124,39 @@ void xiosigaction_hasread(int signum
    Debug1("xiosigaction_hasread(%d)", signum);
 #endif
    if (signum == SIGCHLD) {
-      _errno = errno;
       do {
 	 pid = Waitpid(-1, &status, WNOHANG);
 	 if (pid == 0) {
 	    Msg(wassig?E_INFO:E_WARN,
 		"waitpid(-1, {}, WNOHANG): no child has exited");
-	    Info("childdied() finished");
-	    errno = _errno;
+	    Info("xiosigaction_hasread() finished");
 	    Debug("xiosigaction_hasread() ->");
+	    diag_in_handler = 0;
+	    errno = _errno;
 	    return;
 	 } else if (pid < 0 && errno == ECHILD) {
-	    Msg1(wassig?E_INFO:E_WARN,
-		 "waitpid(-1, {}, WNOHANG): %s", strerror(errno));
-	    Info("childdied() finished");
-	    errno = _errno;
+	    Msg(wassig?E_INFO:E_WARN,
+		 "waitpid(-1, {}, WNOHANG): "F_strerror);
+	    Info("xiosigaction_hasread() finished");
 	    Debug("xiosigaction_hasread() ->");
+	    diag_in_handler = 0;
+	    errno = _errno;
 	    return;
 	 }
 	 wassig = true;
 	 if (pid < 0) {
-	    Warn2("waitpid(-1, {%d}, WNOHANG): %s", status, strerror(errno));
-	    Info("childdied() finished");
-	    errno = _errno;
+	    Warn1("waitpid(-1, {%d}, WNOHANG): "F_strerror, status);
+	    Info("xiosigaction_hasread() finished");
 	    Debug("xiosigaction_hasread() ->");
+	    diag_in_handler = 0;
+	    errno = _errno;
 	    return;
 	 }
 	 if (pid == xio_waitingfor) {
 	    xio_hashappened = true;
 	    Debug("xiosigaction_hasread() ->");
+	    diag_in_handler = 0;
+	    errno = _errno;
 	    return;
 	 }
       } while (1);
@@ -1161,7 +1168,12 @@ void xiosigaction_hasread(int signum
 #else
    xio_hashappened = true;
 #endif
+#if !HAVE_SIGACTION
+   Signal(sig, xiosigaction_hasread);
+#endif /* !HAVE_SIGACTION */
    Debug("xiosigaction_hasread() ->");
+   diag_in_handler = 0;
+   errno = _errno;
    return;
 }
 
@@ -1216,7 +1228,7 @@ int _xioopen_dgram_recvfrom(struct single *xfd, int xioflags,
    applyopts(xfd->fd, opts, PH_PREBIND);
    applyopts(xfd->fd, opts, PH_BIND);
    if ((us != NULL) && Bind(xfd->fd, (struct sockaddr *)us, uslen) < 0) {
-      Msg4(level, "bind(%d, {%s}, "F_Zd"): %s", xfd->fd,
+      Msg4(level, "bind(%d, {%s}, "F_socklen"): %s", xfd->fd,
 	   sockaddr_info(us, uslen, infobuff, sizeof(infobuff)), uslen,
 	   strerror(errno));
       Close(xfd->fd);
@@ -1265,7 +1277,7 @@ int _xioopen_dgram_recvfrom(struct single *xfd, int xioflags,
    {
       struct sigaction act;
       memset(&act, 0, sizeof(struct sigaction));
-      act.sa_flags   = SA_NOCLDSTOP|SA_RESTART
+      act.sa_flags   = SA_NOCLDSTOP/*|SA_RESTART*/
 #ifdef SA_SIGINFO /* not on Linux 2.0(.33) */
 	 |SA_SIGINFO
 #endif
@@ -1278,6 +1290,7 @@ int _xioopen_dgram_recvfrom(struct single *xfd, int xioflags,
 #else /* Linux 2.0(.33) does not have sigaction.sa_sigaction */
       act.sa_handler = xiosigaction_hasread;
 #endif
+      sigfillset(&act.sa_mask);
       if (Sigaction(SIGUSR1, &act, NULL) < 0) {
          /*! Linux man does not explicitely say that errno is defined */
          Warn1("sigaction(SIGUSR1, {&xiosigaction_subaddr_ok}, NULL): %s", strerror(errno));
@@ -1467,7 +1480,7 @@ int _xioopen_dgram_recv(struct single *xfd, int xioflags,
    applyopts(xfd->fd, opts, PH_PREBIND);
    applyopts(xfd->fd, opts, PH_BIND);
    if ((us != NULL) && Bind(xfd->fd, (struct sockaddr *)us, uslen) < 0) {
-      Msg4(level, "bind(%d, {%s}, "F_Zd"): %s", xfd->fd,
+      Msg4(level, "bind(%d, {%s}, "F_socklen"): %s", xfd->fd,
 	   sockaddr_info(us, uslen, infobuff, sizeof(infobuff)), uslen,
 	   strerror(errno));
       Close(xfd->fd);
@@ -1600,7 +1613,7 @@ int xiodopacketinfo(struct msghdr *msgh, bool withlog, bool withenv) {
 	 xiodump(CMSG_DATA(cmsg),
 		 cmsg->cmsg_len-((char *)CMSG_DATA(cmsg)-(char *)cmsg),
 		 valbuff, sizeof(valbuff)-1, 0);
-	 Debug4("ancillary message: len="F_socklen", level=%d, type=%d, data=%s",
+	 Debug4("ancillary message: len="F_cmsg_len", level=%d, type=%d, data=%s",
 		cmsg->cmsg_len, cmsg->cmsg_level, cmsg->cmsg_type,
 		valbuff);
       }
@@ -1648,11 +1661,11 @@ int xiodopacketinfo(struct msghdr *msgh, bool withlog, bool withenv) {
 	 }
 	 if (withenv) {
 	    if (*envp) {
-	       xiosetenv(envp, valp, 1);
+	       xiosetenv(envp, valp, 1, NULL);
 	    } else if (!strcasecmp(typp+strlen(typp)-strlen(namp), namp)) {
-	       xiosetenv(typp, valp, 1);
+	       xiosetenv(typp, valp, 1, NULL);
 	    } else	{
-	       xiosetenv2(typp, namp, valp, 1);
+	       xiosetenv2(typp, namp, valp, 1, NULL);
 	    }
 	 }
 	 if (++i == num)  break;
@@ -1735,7 +1748,7 @@ int xiocheckpeer(xiosingle_t *xfd,
 #if WITH_IP6
       if (pa->soa.sa_family == AF_INET6 &&
 	  ntohs(((struct sockaddr_in6 *)pa)->sin6_port) != xfd->para.socket.ip.sourceport) {
-	 Warn1("refusing connection from %s due to sourceport option",
+	 Warn1("refusing connection from %s due to wrong sourceport",
 	       sockaddr_info((struct sockaddr *)pa, 0,
 			     infobuff, sizeof(infobuff)));
 	 return -1;
@@ -1791,12 +1804,12 @@ int xiocheckpeer(xiosingle_t *xfd,
 #if HAVE_STRUCT_CMSGHDR
 /* converts the ancillary message in *cmsg into a form useable for further
    processing. knows the specifics of common message types.
-   returns the number of resulting syntax elements is *num
+   returns the number of resulting syntax elements in *num
    returns a sequence of \0 terminated type strings in *typbuff
    returns a sequence of \0 terminated name strings in *nambuff
    returns a sequence of \0 terminated value strings in *valbuff
    the respective len parameters specify the available space in the buffers
-   returns STAT_OK
+   returns STAT_OK or other STAT_*
  */
 static int
 xiolog_ancillary_socket(struct cmsghdr *cmsg, int *num,
@@ -1807,6 +1820,7 @@ xiolog_ancillary_socket(struct cmsghdr *cmsg, int *num,
    const char *cmsgtype, *cmsgname, *cmsgenvn;
    size_t msglen;
    struct timeval *tv;
+   int rc = STAT_OK;
 
 #if defined(CMSG_DATA)
 
@@ -1822,7 +1836,7 @@ xiolog_ancillary_socket(struct cmsghdr *cmsg, int *num,
 #endif
    default:	/* binary data */
       snprintf(typbuff, typlen, "SOCKET.%u", cmsg->cmsg_type);
-      strncpy(nambuff, "data", namlen);
+      nambuff[0] = '\0'; strncat(nambuff, "data", namlen-1);
       xiodump(CMSG_DATA(cmsg), msglen, valbuff, vallen, 0);
       return STAT_OK;
 #ifdef SO_TIMESTAMP
@@ -1842,7 +1856,7 @@ xiolog_ancillary_socket(struct cmsghdr *cmsg, int *num,
       cmsgname = "timestamp";
       cmsgenvn = "TIMESTAMP";
       { time_t t = tv->tv_sec; ctime_r(&t, valbuff); }
-      sprintf(strchr(valbuff, '\0')-1/*del \n*/, ", %06ld usecs", (long)tv->tv_usec);
+      snprintf(strchr(valbuff, '\0')-1/*del \n*/, vallen-strlen(valbuff)+1, ", %06ld usecs", (long)tv->tv_usec);
       break;
 #endif /* defined(SO_TIMESTAMP) */
       ;
@@ -1851,13 +1865,13 @@ xiolog_ancillary_socket(struct cmsghdr *cmsg, int *num,
       with type in cmsgtype, name in cmsgname,
       and value already in valbuff */
    *num = 1;
-   if (strlen(cmsgtype) >= typlen)  Fatal("buff too short");
-   strncpy(typbuff, cmsgtype, typlen);
-   if (strlen(cmsgname) >= namlen)  Fatal("buff too short");
-   strncpy(nambuff, cmsgname, namlen);
-   if (strlen(cmsgenvn) >= envlen)  Fatal("buff too short");
-   strncpy(envbuff, cmsgenvn, envlen);
-   return STAT_OK;
+   if (strlen(cmsgtype) >= typlen)  rc = STAT_WARNING;
+   typbuff[0] = '\0'; strncat(typbuff, cmsgtype, typlen-1);
+   if (strlen(cmsgname) >= namlen)  rc = STAT_WARNING;
+   nambuff[0] = '\0'; strncat(nambuff, cmsgname, namlen-1);
+   if (strlen(cmsgenvn) >= envlen)  rc = STAT_WARNING;
+   envbuff[0] = '\0'; strncat(envbuff, cmsgenvn, envlen-1);
+   return rc;
 
 #else /* !defined(CMSG_DATA) */
 
@@ -1874,7 +1888,7 @@ xiolog_ancillary_socket(struct cmsghdr *cmsg, int *num,
    provide one in parameter ins to avoid creation of a dummy socket. ins must
    be <0 if it does not specify a socket fd. */
 char *xiogetifname(int ind, char *val, int ins) {
-#if !HAVE_IF_INDEXTONAME
+#if !HAVE_PROTOTYPE_LIB_if_indextoname
    int s;
    struct ifreq ifr;
 
@@ -1908,9 +1922,9 @@ char *xiogetifname(int ind, char *val, int ins) {
    if (ins < 0)  Close(s);
    strcpy(val, ifr.ifr_name);
    return val;
-#else /* HAVE_IF_INDEXTONAME */
+#else /* HAVE_PROTOTYPE_LIB_if_indextoname */
    return if_indextoname(ind, val);
-#endif /* HAVE_IF_INDEXTONAME */
+#endif /* HAVE_PROTOTYPE_LIB_if_indextoname */
 }
 
 
@@ -1942,7 +1956,7 @@ int xioparsenetwork(const char *rangename, int pf, struct xiorange *range) {
      if ((addrname = Malloc(maskname-rangename)) == NULL) {
 	return STAT_NORETRY;
      }
-     strncpy(addrname, rangename, maskname-rangename-1);
+     strncpy(addrname, rangename, maskname-rangename-1);	/* ok */
      addrname[maskname-rangename-1] = '\0';
      result =
 	dalan(addrname, (char *)&range->netaddr.soa.sa_data, &addrlen,
@@ -2039,7 +2053,7 @@ int xiosetsockaddrenv(const char *lr,
 	 xiosetsockaddrenv_unix(idx, strchr(namebuff, '\0'), XIOSOCKADDRENVLEN-strlen(lr),
 				valuebuff, XIOSOCKADDRENVLEN,
 				&sau->un, salen, proto);
-      xiosetenv(namebuff, valuebuff, 1);
+      xiosetenv(namebuff, valuebuff, 1, NULL);
       break;
 #endif /* WITH_UNIX */
 #if WITH_IP4
@@ -2049,7 +2063,7 @@ int xiosetsockaddrenv(const char *lr,
 	    xiosetsockaddrenv_ip4(idx, strchr(namebuff, '\0'), XIOSOCKADDRENVLEN-strlen(lr),
 				  valuebuff, XIOSOCKADDRENVLEN,
 				  &sau->ip4, proto);
-	 xiosetenv(namebuff, valuebuff, 1);
+	 xiosetenv(namebuff, valuebuff, 1, NULL);
 	 namebuff[strlen(lr)] = '\0';  ++idx;
       } while (result > 0);
       break; 
@@ -2062,7 +2076,7 @@ int xiosetsockaddrenv(const char *lr,
 	    xiosetsockaddrenv_ip6(idx, strchr(namebuff, '\0'), XIOSOCKADDRENVLEN-strlen(lr),
 				  valuebuff, XIOSOCKADDRENVLEN,
 				  &sau->ip6, proto);
-	 xiosetenv(namebuff, valuebuff, 1);
+	 xiosetenv(namebuff, valuebuff, 1, NULL);
 	 namebuff[strlen(lr)] = '\0';  ++idx;
       } while (result > 0);
       break; 
@@ -2083,7 +2097,7 @@ int xiosetsockaddrenv(const char *lr,
 
 /* these do sockets internally */
 
-/* retrieves options so-type and so-prototype from opts, calls socketpair, and
+/* retrieves options so-type and so-prototype from opts, calls socket, and
    ev. generates an appropriate error message.
    returns 0 on success or -1 if an error occurred. */
 int 
